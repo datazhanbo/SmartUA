@@ -125,6 +125,7 @@ class ConnectorService:
             "update_campaign_budget": connector.update_campaign_budget,
             "update_campaign_status": connector.update_campaign_status,
             "update_adset_bid": connector.update_adset_bid,
+            "rotate_creative": connector.rotate_creative,
         }
 
         handler = operation_map.get(operation)

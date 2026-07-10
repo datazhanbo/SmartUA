@@ -1,5 +1,6 @@
 from pydantic_settings import BaseSettings
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
+from pathlib import Path
 import json
 
 
@@ -38,6 +39,33 @@ class Settings(BaseSettings):
 
     # 是否启用 LLM 降级（无可用 LLM 时使用规则引擎）
     llm_fallback_enabled: bool = True
+
+    # ===== Agent Loop（Phase 1）配置 =====
+    # 默认执行平台：Meta 账户被封期间用 mock 因果模拟引擎作为数据土壤；
+    # Meta 恢复后改为 "meta" 即可，上层 Agent Loop 与意图引擎零改动。
+    agent_default_platform: str = "mock"
+    # 单轮决策最大步数，防止 ReAct 无限循环
+    agent_max_steps: int = 15
+    # 是否在 Agent Loop 中使用 LLM 规划（关闭则纯规则引擎兜底）
+    agent_use_llm_planning: bool = True
+    # 是否启用 Phase 2 记忆/反思闭环（关闭则写动作不再沉淀 Episode）
+    agent_reflection_enabled: bool = True
+    # Phase 3 策略自演化：策略参数落盘路径（跨进程/跨账户迁移；None=不落盘）
+    agent_strategy_path: Optional[str] = str(
+        Path(__file__).resolve().parent.parent / "data" / "strategy.json"
+    )
+
+    # ===== Phase 4 主动式自治（Proactive Autonomy）配置 =====
+    # 是否启动 APScheduler 后台周期巡检（检测异常并分级处置）
+    agent_autonomy_enabled: bool = True
+    # 巡检间隔（秒）；开发/演示期设短，生产建议 300（5 分钟）起
+    agent_autonomy_interval_seconds: int = 120
+    # 同 (异常类型, campaign) 重复告警冷却（扫描次数），避免每轮重复提案
+    agent_autonomy_cooldown_scans: int = 3
+    # 素材疲劳阈值（天）：creative_age 超过则触发轮换建议（L0 自动）
+    agent_fatigue_threshold_days: int = 8
+    # 主动监控的 app 列表（演示期仅 app_id=1）
+    agent_monitor_app_ids: List[int] = [1]
 
     class Config:
         env_file = ".env"

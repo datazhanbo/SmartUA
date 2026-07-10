@@ -1,6 +1,7 @@
 import React, { useState, useEffect, createContext, useContext } from 'react'
 import { BrowserRouter, Routes, Route, Navigate, useNavigate } from 'react-router-dom'
 import { message } from 'antd'
+import AgentConsole from './pages/AgentConsole'
 import Login from './pages/Login'
 import Dashboard from './pages/Dashboard'
 import IntentCenter from './pages/IntentCenter'
@@ -91,6 +92,13 @@ function AppContent() {
           <ProtectedRoute user={user}>
             <MainLayout user={user} onLogout={handleLogout}>
               <IntentCenter user={user} />
+            </MainLayout>
+          </ProtectedRoute>
+        } />
+        <Route path="/agent" element={
+          <ProtectedRoute user={user}>
+            <MainLayout user={user} onLogout={handleLogout}>
+              <AgentConsole />
             </MainLayout>
           </ProtectedRoute>
         } />

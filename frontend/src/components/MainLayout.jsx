@@ -8,7 +8,8 @@ import {
   BellOutlined,
   DatabaseOutlined,
   ApiOutlined,
-  VideoCameraOutlined
+  VideoCameraOutlined,
+  RobotOutlined
 } from '@ant-design/icons'
 import { useNavigate, useLocation } from 'react-router-dom'
 
@@ -22,6 +23,7 @@ function MainLayout({ children, user, onLogout }) {
 
   const menuItems = [
     { key: '/dashboard', icon: <DashboardOutlined />, label: '投放大盘' },
+    { key: '/agent', icon: <RobotOutlined />, label: '智能体控制台' },
     { key: '/intent', icon: <ThunderboltOutlined />, label: '意图操作中心' },
     { key: '/creatives', icon: <VideoCameraOutlined />, label: '素材管理' },
     { key: '/data-management', icon: <DatabaseOutlined />, label: '数据管理中心' },

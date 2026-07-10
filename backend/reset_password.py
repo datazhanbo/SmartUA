@@ -1,4 +1,4 @@
-"""Reset admin password to admin123"""
+"""Reset ALL users password to admin123"""
 import sys
 sys.path.insert(0, '.')
 
@@ -11,14 +11,12 @@ pwd_context = CryptContext(schemes=["sha256_crypt"], deprecated="auto")
 if __name__ == "__main__":
     db = SessionLocal()
     try:
-        user = db.query(User).filter(User.email == "admin@smartua.com").first()
-        if user:
-            hashed = pwd_context.hash("admin123")
+        users = db.query(User).all()
+        hashed = pwd_context.hash("admin123")
+        for user in users:
             user.password_hash = hashed
-            db.commit()
-            print(f"Password reset for admin@smartua.com")
-            print(f"Hash: {hashed}")
-        else:
-            print("User not found")
+            print(f"Password reset for: {user.email}")
+        db.commit()
+        print(f"\nAll {len(users)} users password reset to: admin123")
     finally:
         db.close()

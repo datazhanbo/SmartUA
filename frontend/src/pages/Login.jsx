@@ -31,7 +31,7 @@ function Login({ onLogin }) {
         <Form
           onFinish={handleSubmit}
           layout="vertical"
-          initialValues={{ email: 'optimizer1@smartua.com', password: '123456' }}
+          initialValues={{ email: 'optimizer1@smartua.com', password: 'admin123' }}
         >
           <Form.Item
             label="邮箱"
@@ -58,9 +58,9 @@ function Login({ onLogin }) {
 
         <div style={{ textAlign: 'center', marginTop: 16 }}>
           <Text type="secondary">
-            优化师: optimizer1@smartua.com / 123456
+            优化师: optimizer1@smartua.com / admin123
             <br />
-            管理员: admin@smartua.com / 123456
+            管理员: admin@smartua.com / admin123
           </Text>
         </div>
       </Card>

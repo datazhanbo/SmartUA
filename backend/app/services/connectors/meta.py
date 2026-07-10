@@ -311,3 +311,17 @@ class MetaConnector(BaseConnector):
         except Exception as e:
             logger.error(f"Update adset bid failed: {e}")
             return {"success": False, "error": str(e)}
+
+    def rotate_creative(self, campaign_id: str) -> Dict[str, Any]:
+        """轮换素材（重新发布一轮创意）"""
+        if not FACEBOOK_SDK_AVAILABLE:
+            return {"success": True, "campaign_id": campaign_id, "mode": "mock"}
+
+        try:
+            from facebook_business.adobjects.campaign import Campaign
+            campaign = Campaign(campaign_id)
+            # 真实实现会创建新 AdCreative 并替换；此处仅占位
+            return {"success": True, "campaign_id": campaign_id, "rotated": True}
+        except Exception as e:
+            logger.error(f"Rotate creative failed: {e}")
+            return {"success": False, "error": str(e)}

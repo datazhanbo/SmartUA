@@ -5,6 +5,7 @@ from .base import BaseConnector
 from .meta import MetaConnector
 from .google import GoogleAdsConnector
 from .appsflyer import AppsFlyerConnector
+from .mock_media import MockMediaConnector
 
 
 class ConnectorFactory:
@@ -14,6 +15,7 @@ class ConnectorFactory:
         "meta": MetaConnector,
         "google": GoogleAdsConnector,
         "appsflyer": AppsFlyerConnector,
+        "mock": MockMediaConnector,   # 有状态因果模拟媒体（替代被封的 Meta）
     }
 
     @classmethod
@@ -52,5 +54,6 @@ __all__ = [
     "MetaConnector",
     "GoogleAdsConnector",
     "AppsFlyerConnector",
+    "MockMediaConnector",
     "ConnectorFactory",
 ]

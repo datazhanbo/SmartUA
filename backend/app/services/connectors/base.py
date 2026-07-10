@@ -394,3 +394,28 @@ class BaseConnector(ABC):
             logger.error(error_msg, exc_info=True)
             self.update_run_failed(error_msg)
             return {"success": False, "error": error_msg}
+
+    def apply_action(self, action: str, entity_id: str, **params) -> Dict[str, Any]:
+        """通用写动作分发器：把 Agent Tool Registry 的动作映射到具体连接器方法。
+
+        设计目的（见 docs/AGENTIC_AD_PLATFORM_UPGRADE.md）：
+        Agent Loop 的写工具统一调用此方法，而非具体连接器方法，从而与连接器解耦——
+        Meta 账户恢复后只需在工厂把 "mock" 换回 "meta"，上层 Tool Registry 与
+        意图引擎零改动。子类可重写以实现自定义语义；默认实现映射到标准 update_* 方法。
+
+        支持的动作：
+        - update_campaign_status / update_campaign_budget / update_adset_bid
+        - rotate_creative（仅当连接器实现了该方法，如 MockMediaConnector）
+        """
+        if action == "update_campaign_status":
+            return self.update_campaign_status(entity_id, params.get("status", "ACTIVE"))
+        if action == "update_campaign_budget":
+            return self.update_campaign_budget(entity_id, float(params.get("daily_budget", 0)))
+        if action == "update_adset_bid":
+            return self.update_adset_bid(entity_id, float(params.get("bid_amount", 1.0)))
+        if action == "rotate_creative":
+            fn = getattr(self, "rotate_creative", None)
+            if fn is None:
+                return {"success": False, "error": f"{self.platform} 连接器不支持 rotate_creative"}
+            return fn(entity_id)
+        return {"success": False, "error": f"不支持的动作: {action}"}
