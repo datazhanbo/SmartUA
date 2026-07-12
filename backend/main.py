@@ -20,6 +20,13 @@ Base.metadata.create_all(bind=engine)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # 启动：初始化 LLM 路由（配置好 key 后 Agent Loop 即可调用真实大模型）
+    try:
+        from app.services.llm import get_llm_router
+        get_llm_router(settings.get_llm_providers_config())
+    except Exception as e:
+        logger.warning("LLM 路由初始化失败（将使用规则引擎兜底）：%s", e)
+
     # 启动：若开启主动自治，拉起 APScheduler 后台周期巡检
     if settings.agent_autonomy_enabled:
         try:
@@ -39,7 +46,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="SmartUA Platform API",
     description="智能投放平台 - 支持大模型意图识别、操作安全分级控制、闭环学习优化（迈向 Agentic）",
-    version="1.6.0",
+    version="1.7.0",
     lifespan=lifespan,
 )
 

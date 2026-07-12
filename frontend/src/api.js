@@ -68,6 +68,10 @@ export const agentAPI = {
     api.post(`/agent/sessions/${id}/approve`, { step_id: stepId, approved, reason }),
   // 多轮追问 / 追加指令
   sendMessage: (id, text) => api.post(`/agent/sessions/${id}/message`, { text }),
+  // 中断当前运行中的 Loop（优雅停机）
+  abortSession: (id) => api.post(`/agent/sessions/${id}/abort`),
+  // 中途改向：中断当前 Loop 并按新指令重启一轮 ReAct
+  redirectSession: (id, text) => api.post(`/agent/sessions/${id}/redirect`, { text }),
   // 全局复盘（基于沉淀的 Episode 记忆）
   reflect: () => api.post('/agent/reflect'),
   // 按会话复盘

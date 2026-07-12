@@ -25,6 +25,8 @@ Thumbs.db
 .env.local
 .env.*.local
 *.env
+# SmartUA 后端 env（含方舟 API Key 等密钥，禁止提交；已有的 backend/.env 已被 *.env 覆盖，此处显式声明以防误 git add -f）
+backend/.env
 
 # Database
 *.db

@@ -14,11 +14,15 @@
 """
 from __future__ import annotations
 
+import os
+import re
 import uuid
+import urllib.parse
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
+import httpx
 from app.services.intent_engine import RISK_LEVEL_MAP
 
 
@@ -302,6 +306,144 @@ def _record_execution(ctx: AgentContext, *, intent_class: str, risk_level: str,
 
 
 # --------------------------------------------------------------------------- #
+# 外部检索工具：market_research（真实搜索优先 + 内置行业基准库兜底）
+# --------------------------------------------------------------------------- #
+# 内置行业基准库（示例数据，覆盖常见品类×国家×渠道）。
+# 标注：生产环境应接入 Sensor Tower / AppTweak / 点点数据 / AppsFlyer 等真实数据源。
+BENCHMARK_DB: Dict[tuple, Dict[str, float]] = {
+    ("ai_video_editor", "US", "Meta"):   {"cpi": 3.2, "cpa": 11.5, "roas": 1.45},
+    ("ai_video_editor", "US", "TikTok"): {"cpi": 2.4, "cpa": 9.0,  "roas": 1.60},
+    ("ai_video_editor", "US", "Google"): {"cpi": 3.8, "cpa": 13.0, "roas": 1.30},
+    ("ai_video_editor", "UK", "Meta"):   {"cpi": 3.5, "cpa": 12.5, "roas": 1.40},
+    ("ai_video_editor", "UK", "TikTok"): {"cpi": 2.6, "cpa": 9.8,  "roas": 1.55},
+    ("ai_video_editor", "CA", "Meta"):   {"cpi": 3.3, "cpa": 12.0, "roas": 1.42},
+    ("ai_video_editor", "JP", "Meta"):   {"cpi": 4.1, "cpa": 15.0, "roas": 1.30},
+    ("game", "US", "Meta"):              {"cpi": 4.5, "cpa": 18.0, "roas": 1.20},
+    ("game", "US", "TikTok"):            {"cpi": 3.0, "cpa": 12.0, "roas": 1.50},
+    ("game", "UK", "Meta"):              {"cpi": 4.8, "cpa": 19.0, "roas": 1.18},
+    ("ecommerce", "US", "Meta"):         {"cpi": 2.8, "cpa": 10.0, "roas": 1.80},
+    ("ecommerce", "US", "Google"):       {"cpi": 3.0, "cpa": 10.5, "roas": 1.70},
+    ("ecommerce", "CA", "Meta"):         {"cpi": 2.9, "cpa": 10.2, "roas": 1.75},
+}
+
+
+def _norm_category(c: Optional[str]) -> Optional[str]:
+    if not c:
+        return None
+    c = c.lower()
+    if "video" in c or "剪辑" in c or "editor" in c or "剪映" in c or "capcut" in c:
+        return "ai_video_editor"
+    if "game" in c or "游戏" in c:
+        return "game"
+    if "ecom" in c or "电商" in c or "shop" in c or "零售" in c:
+        return "ecommerce"
+    return None
+
+
+def _norm_country(co: Optional[str]) -> Optional[str]:
+    if not co:
+        return None
+    co = co.upper()
+    return co if co in ("US", "UK", "CA", "JP", "DE", "BR", "AU") else None
+
+
+def _norm_channel(ch: Optional[str]) -> Optional[str]:
+    if not ch:
+        return None
+    ch = ch.lower()
+    if "meta" in ch or "facebook" in ch or " fb" in ch:
+        return "Meta"
+    if "tiktok" in ch or "tt" in ch:
+        return "TikTok"
+    if "google" in ch or "adwords" in ch:
+        return "Google"
+    return None
+
+
+def _infer_category(query: str) -> Optional[str]:
+    return _norm_category(query)
+
+
+def _web_search(query: str, max_results: int = 3) -> Optional[List[Dict[str, str]]]:
+    """真实网络检索（经本地代理出网）。失败/超时/无结果返回 None，由调用方回退基准库。"""
+    try:
+        q = urllib.parse.quote(query)
+        url = f"https://lite.duckduckgo.com/lite/?q={q}"
+        proxy = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; SmartUA/1.0)"}
+        with httpx.Client(proxy=proxy, timeout=httpx.Timeout(15.0),
+                          trust_env=True, follow_redirects=True) as c:
+            r = c.get(url, headers=headers)
+            r.raise_for_status()
+            html = r.text
+        items = []
+        blocks = re.findall(
+            r'class="result-link"[^>]*href="([^"]+)"[^>]*>(.*?)</a>.*?'
+            r'class="result-snippet">(.*?)</td>', html, re.S)
+        for href, title, snippet in blocks[:max_results]:
+            items.append({
+                "title": re.sub(r"<[^>]+>", "", title).strip(),
+                "url": href,
+                "snippet": re.sub(r"<[^>]+>", "", snippet).strip(),
+            })
+        return items or None
+    except Exception:
+        return None
+
+
+def _benchmark_lookup(category, country, channel) -> List[Dict[str, Any]]:
+    cat = _norm_category(category)
+    cty = _norm_country(country)
+    ch = _norm_channel(channel)
+    out = []
+    for (c, co, chh), m in BENCHMARK_DB.items():
+        if cat and c != cat:
+            continue
+        if cty and co != cty:
+            continue
+        if ch and chh != ch:
+            continue
+        out.append({"label": f"{c}/{co}/{chh}", **m})
+    # 严格匹配无果但给了品类：放宽国家/渠道，返回该品类全渠道样本
+    if not out and cat:
+        for (c, co, chh), m in BENCHMARK_DB.items():
+            if c == cat:
+                out.append({"label": f"{c}/{co}/{chh}", **m})
+    return out
+
+
+def _market_research(params: Dict, ctx: AgentContext) -> ToolResult:
+    """跳出平台内部数据，从市场/行业视角获取 CPI/CPA/ROAS 基准与外部检索结果。
+
+    - 真实网络检索优先（经代理）；失败/无结果/无 query 时回退内置行业基准库。
+    - 两者都给出，前端与模型即可获得"外部视角"，不再只依赖自有账户。
+    """
+    query = (params.get("query") or "").strip()
+    category = params.get("category") or _infer_category(query)
+    country = params.get("country")
+    channel = params.get("channel")
+
+    web = _web_search(query) if query else None
+    bench = _benchmark_lookup(category, country, channel)
+
+    parts: List[str] = []
+    if bench:
+        parts.append("【行业基准（内置库 · 示例数据）】")
+        for b in bench:
+            parts.append(f"  · {b['label']}：CPI≈${b['cpi']}  CPA≈${b['cpa']}  ROAS≈{b['roas']}x")
+        parts.append("  ⚠️ 以上为示例行业基准，生产建议接入 Sensor Tower / AppTweak / 点点数据 等真实数据源。")
+    if web:
+        parts.append("【网络检索结果（实时）】")
+        for w in web:
+            parts.append(f"  · {w['title']}\n    {w['snippet'][:200]}\n    {w['url']}")
+    if not parts:
+        obs = f"未找到关于「{query or category}」的行业基准或网络信息。"
+    else:
+        obs = "\n".join(parts)
+    return ToolResult(ok=True, observation=obs, data={"benchmark": bench, "web": web})
+
+
+# --------------------------------------------------------------------------- #
 # Registry
 # --------------------------------------------------------------------------- #
 def _build_registry() -> Dict[str, Tool]:
@@ -337,6 +479,14 @@ def _build_registry() -> Dict[str, Tool]:
         "rotate_creative": Tool(
             "rotate_creative", "轮换素材（重置素材疲劳，短期提升 CTR）",
             "L0", "write", '{"entity_id":<str>}', _rotate),
+        "market_research": Tool(
+            "market_research",
+            "跳出平台内部数据，从市场/行业视角检索 CPI/CPA/ROAS 基准与外部信息"
+            "（真实网络检索优先，失败时回退内置行业基准库）",
+            "L0", "read",
+            '{"query":<str>,"category":<"ai_video_editor"/"game"/"ecommerce">,'
+            '"country":<"US"/"UK"/"CA"/"JP">,"channel":<"Meta"/"TikTok"/"Google">}',
+            _market_research),
     }
 
 

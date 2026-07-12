@@ -3,7 +3,9 @@
 根据意图复杂度、数据敏感性、响应时间、成本预算选择最优模型
 """
 import json
+import os
 import time
+import httpx
 from typing import Dict, List, Any, Optional, Tuple
 from enum import Enum
 from datetime import datetime
@@ -153,6 +155,89 @@ class DeepSeekProvider(LLMProvider):
         return bool(self.api_key)
 
 
+class ArkProvider(LLMProvider):
+    """火山引擎方舟（Volcengine Ark）Provider —— 兼容 OpenAI Chat Completions 协议"""
+
+    async def chat_completion(self, messages: List[Dict[str, str]],
+                            temperature: float = 0.7,
+                            max_tokens: int = 1000,
+                            stream: bool = False) -> Any:
+        if not self.is_available():
+            raise ValueError("Ark API key not configured")
+
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": stream,
+        }
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        # 推理类模型（如方舟 DeepSeek-R1 等）会先长思考再回答，且生产常经代理出网，
+        # 故放宽超时并显式带代理环境变量，避免 ReadTimeout。
+        proxy = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
+        client_kwargs = dict(
+            proxy=proxy,
+            timeout=httpx.Timeout(180.0, connect=15.0),
+            trust_env=True,
+        )
+
+        if stream:
+            # 流式：逐块 yield {"type":"reasoning"/"content","text": delta}，供 Agent Loop 实时填充思考步骤
+            async def _gen():
+                async with httpx.AsyncClient(**client_kwargs) as client:
+                    async with client.stream(
+                        "POST",
+                        f"{self.base_url.rstrip('/')}/chat/completions",
+                        json=payload, headers=headers,
+                    ) as resp:
+                        resp.raise_for_status()
+                        async for line in resp.aiter_lines():
+                            if not line or not line.startswith("data:"):
+                                continue
+                            payload_str = line[len("data:"):].strip()
+                            if payload_str == "[DONE]":
+                                break
+                            try:
+                                obj = json.loads(payload_str)
+                            except Exception:
+                                continue
+                            choices = obj.get("choices") or []
+                            if not choices:
+                                continue
+                            delta = choices[0].get("delta") or {}
+                            if delta.get("reasoning_content"):
+                                yield {"type": "reasoning", "text": delta["reasoning_content"]}
+                            if delta.get("content"):
+                                yield {"type": "content", "text": delta["content"]}
+            return _gen()
+
+        # 非流式：返回完整结果，并捕获推理模型的 reasoning_content（思考过程）
+        async with httpx.AsyncClient(**client_kwargs) as client:
+            resp = await client.post(
+                f"{self.base_url.rstrip('/')}/chat/completions",
+                json=payload, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+        msg = data["choices"][0]["message"]
+        content = msg.get("content") or ""
+        reasoning = msg.get("reasoning_content") or ""
+        usage = data.get("usage", {})
+        return {
+            "provider": "ark",
+            "model": self.model,
+            "content": content,
+            "reasoning": reasoning,
+            "usage": usage,
+        }
+
+    def is_available(self) -> bool:
+        return bool(self.api_key)
+
+
 class LocalModelProvider(LLMProvider):
     """本地模型 Provider（如 Qwen、Llama 等）"""
 
@@ -213,6 +298,7 @@ class LLMRouter:
             "claude": ClaudeProvider,
             "gpt4": GPT4Provider,
             "deepseek": DeepSeekProvider,
+            "ark": ArkProvider,
             "local": LocalModelProvider,
         }
 
@@ -319,9 +405,18 @@ class LLMRouter:
                 "message": "No LLM available, using rule-based fallback"
             }
 
-        # 尝试调用首选
+        stream = kwargs.pop("stream", False)
+        provider = self.providers[provider_id]
+
+        # 流式：优先在主 provider 上尝试（仅 Ark 等支持的 provider 会返回 async generator）
+        if stream:
+            try:
+                return await provider.chat_completion(messages, stream=True, **kwargs)
+            except Exception:
+                pass  # 主 provider 流式失败，落到下方非流式兜底
+
+        # 尝试调用首选（非流式）
         try:
-            provider = self.providers[provider_id]
             result = await provider.chat_completion(messages, **kwargs)
             result["routed_provider"] = provider_id
             return result

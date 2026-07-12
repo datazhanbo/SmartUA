@@ -31,6 +31,11 @@ class Settings(BaseSettings):
     deepseek_model: str = "deepseek-chat"
     deepseek_base_url: str = "https://api.deepseek.com"
 
+    # 火山引擎方舟（Volcengine Ark，OpenAI 兼容协议，国内网络友好）
+    ark_api_key: Optional[str] = None
+    ark_model: str = "ep-xxxxxxxx"   # Ark 推理接入点 Endpoint ID（控制台创建后填入）
+    ark_base_url: str = "https://ark.cn-beijing.volces.com/api/v3"
+
     local_model_base_url: str = "http://localhost:8000/v1"
     local_model_name: str = "qwen2.5-72b-instruct"
 
@@ -107,6 +112,18 @@ class Settings(BaseSettings):
                     "avg_latency_ms": 800,
                     "priority": 3,
                 },
+                "ark": {
+                    "provider_type": "ark",
+                    "name": "Volcengine Ark (方舟)",
+                    "api_key": self.ark_api_key,
+                    "base_url": self.ark_base_url,
+                    "model": self.ark_model,
+                    "capabilities": ["complex_intent", "strategy_analysis",
+                                    "creative_generation", "fast_response"],
+                    "cost_per_1k_tokens": 0.8,
+                    "avg_latency_ms": 1200,
+                    "priority": 1,
+                },
                 "local": {
                     "provider_type": "local",
                     "name": "Qwen 2.5 72B",
@@ -130,7 +147,13 @@ class Settings(BaseSettings):
                 {
                     "intent": "creative.rotate",
                     "required_capabilities": ["creative_generation"],
-                    "preferred_provider": "gpt4",
+                    "preferred_provider": "ark",
+                    "fallback_provider": "gpt4",
+                },
+                {
+                    "intent": "campaign.optimize_batch",
+                    "required_capabilities": ["complex_intent", "strategy_analysis"],
+                    "preferred_provider": "ark",
                     "fallback_provider": "claude",
                 },
                 {

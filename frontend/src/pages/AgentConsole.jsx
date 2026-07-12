@@ -18,7 +18,8 @@ const APP_ID = 1
 
 // 步骤类型 → 渲染配置
 const KIND_META = {
-  thought: { emoji: '💭', color: '#8c8c8c', label: '推理' },
+  reasoning: { emoji: '🧠', color: '#722ed1', label: '思考过程' },
+  thought: { emoji: '💭', color: '#8c8c8c', label: '决策理由' },
   observation: { emoji: '👁', color: '#8c8c8c', label: '观察' },
   action: { emoji: '✅', color: '#52c41a', label: '已执行' },
   approval: { emoji: '⏳', color: '#faad14', label: '待审批' },
@@ -106,6 +107,25 @@ function StepView({ step, loading, onApprove }) {
               {step.status === 'approved' ? '已批准 · Agent 续跑' : '已驳回 · 重新规划'}
             </Tag>
           )}
+        </Space>
+      </Card>
+    )
+  }
+
+  if (step.kind === 'reasoning') {
+    const thinking = step.status === 'thinking'
+    return (
+      <Card size="small" style={{ borderLeft: '4px solid #722ed1', background: '#f9f0ff', marginBottom: 12 }}>
+        <Space direction="vertical" style={{ width: '100%' }} size={4}>
+          <Space wrap>
+            <Tag color="purple" icon={<span>🧠</span>}>{thinking ? '思考中…' : '思考过程'}</Tag>
+            {thinking && <Spin size="small" />}
+          </Space>
+          <div style={{ maxHeight: 300, overflowY: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                        fontSize: 13, lineHeight: 1.7, color: '#333',
+                        background: '#fff', borderRadius: 4, padding: '8px 10px', border: '1px solid #efdbff' }}>
+            {step.text}
+          </div>
         </Space>
       </Card>
     )
@@ -279,6 +299,7 @@ function AgentConsole() {
   const [autoAlerts, setAutoAlerts] = useState([])
   const [autoLoading, setAutoLoading] = useState(false)
   const autoTimer = useRef(null)
+  const esRef = useRef(null)
 
   // 初始加载：会话列表 + 已学策略 + 主动自治状态
   useEffect(() => { refreshSessions(); refreshStrategy(); refreshAutonomy() }, [])
@@ -293,6 +314,60 @@ function AgentConsole() {
     autoTimer.current = setInterval(() => refreshAutonomy(), 15000)
     return () => clearInterval(autoTimer.current)
   }, [])
+
+  // Agent 运行实时流：用 SSE 订阅会话步骤（后端 Loop 在后台执行，逐步推送
+  // thought/observation/action…，避免整轮跑完才一次性返回）。EventSource 自动重连。
+  useEffect(() => {
+    if (!activeId) return
+    const token = localStorage.getItem('token') || ''
+    const url = `/api/v1/agent/sessions/${activeId}/stream?token=${encodeURIComponent(token)}`
+    const es = new EventSource(url)
+    esRef.current = es
+
+    es.addEventListener('snapshot', (e) => {
+      try {
+        const d = JSON.parse(e.data)
+        setSession((s) => ({ ...(s || { id: activeId }), steps: d.steps || [], status: d.status }))
+      } catch (_) { /* ignore */ }
+    })
+    es.addEventListener('step', (e) => {
+      try {
+        const step = JSON.parse(e.data)
+        setSession((s) => {
+          if (!s) return s
+          const idx = s.steps.findIndex((x) => x.id === step.id)
+          if (idx >= 0) {
+            // 已存在（如思考步骤流式增长）：按 id 原地更新
+            const steps = s.steps.slice()
+            steps[idx] = { ...steps[idx], ...step }
+            return { ...s, steps }
+          }
+          return { ...s, steps: [...s.steps, step] }
+        })
+      } catch (_) { /* ignore */ }
+    })
+    es.addEventListener('status', (e) => {
+      try {
+        const d = JSON.parse(e.data)
+        setSession((s) => (s ? { ...s, status: d.status } : s))
+      } catch (_) { /* ignore */ }
+    })
+    es.addEventListener('end', (e) => {
+      try {
+        const d = JSON.parse(e.data)
+        setSession((s) => (s ? { ...s, status: d.status } : s))
+      } catch (_) { /* ignore */ }
+      es.close()  // 终态：关闭流
+    })
+    es.onerror = () => {
+      // EventSource 会自动重连；终态会话由 end 事件关闭，这里不主动关闭
+    }
+
+    return () => {
+      es.close()
+      esRef.current = null
+    }
+  }, [activeId])
 
   const refreshSessions = async () => {
     try {
@@ -341,12 +416,31 @@ function AgentConsole() {
     } finally { setLoading(false) }
   }
 
+  const handleStop = async () => {
+    if (!activeId) return
+    setLoading(true)
+    try {
+      await agentAPI.abortSession(activeId)
+      message.info('已请求中断，Agent 将停止当前循环')
+    } catch (e) {
+      message.error('中断失败：' + (e.response?.data?.detail || '未知错误'))
+    } finally { setLoading(false) }
+  }
+
   const handleSend = async () => {
     if (!activeId || !msg.trim()) return
     setLoading(true)
     try {
-      const s = await agentAPI.sendMessage(activeId, msg)
-      setSession(s); setMsg(''); await refreshSessions()
+      if (session?.status === 'running') {
+        // 运行中途发新指令：中断当前 Loop 并按新方向续跑（SSE 同会话无缝继续）
+        await agentAPI.redirectSession(activeId, msg)
+        setMsg('')
+        message.info('已改向：Agent 将按新指令继续')
+      } else {
+        const s = await agentAPI.sendMessage(activeId, msg)
+        setSession(s); setMsg('')
+      }
+      await refreshSessions()
     } catch (e) {
       message.error('发送失败：' + (e.response?.data?.detail || '未知错误'))
     } finally { setLoading(false) }
@@ -485,6 +579,12 @@ function AgentConsole() {
                 <Space>
                   <span>目标：{session.goal}</span>
                   {statusTag && <Tag color={statusTag.color}>{statusTag.label}</Tag>}
+                  {session.status === 'running' && (
+                    <Tag color="processing" style={{ marginLeft: 4 }}>
+                      <span style={{ display: 'inline-block', width: 6, height: 6, borderRadius: '50%', background: '#1890ff', marginRight: 6, animation: 'ant-status-processing 1.2s infinite' }} />
+                      实时流式
+                    </Tag>
+                  )}
                 </Space>
               }
               extra={<Button size="small" onClick={handleNew}>新建</Button>}
@@ -503,7 +603,12 @@ function AgentConsole() {
                   onPressEnter={handleSend}
                   disabled={loading}
                 />
-                <Button type="primary" icon={<SendOutlined />} loading={loading} onClick={handleSend}>发送</Button>
+                {session.status === 'running' && (
+                  <Button danger icon={<StopOutlined />} loading={loading} onClick={handleStop}>停止</Button>
+                )}
+                <Button type="primary" icon={<SendOutlined />} loading={loading} onClick={handleSend}>
+                  {session.status === 'running' ? '改向继续' : '发送'}
+                </Button>
               </Space.Compact>
             </Card>
           )}

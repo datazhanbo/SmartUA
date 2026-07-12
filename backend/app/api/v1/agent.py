@@ -9,13 +9,17 @@
 
 执行平台：settings.agent_default_platform（Meta 被封期间为 mock 因果模拟引擎）。
 """
-from fastapi import APIRouter, Depends, HTTPException, Query
+import asyncio
+import json
+import threading
+from fastapi import APIRouter, Depends, HTTPException, Query, Header
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional, List
 from sqlalchemy.orm import Session
 
-from app.db.base import get_db
-from app.core.security import get_current_user
+from app.db.base import get_db, SessionLocal
+from app.core.security import get_current_user, decode_token
 from app.models.sys import User
 from app.config import settings
 from app.services.agent_runtime import (
@@ -26,6 +30,9 @@ from app.services.agent_runtime.autonomy import (
     update_alert_for_session,
 )
 from app.services.agent_runtime.reflection import Reflector
+from app.services.agent_runtime.session import (
+    AgentStep, AgentStepKind, AgentStepStatus,
+)
 
 router = APIRouter(prefix="/agent", tags=["agent"])
 
@@ -56,6 +63,67 @@ def _make_ctx(db: Session, user: User, app_id: int) -> AgentContext:
                         strategy=get_strategy())
 
 
+# ----------------------------- 后台异步执行 Agent Loop ----------------------------- #
+# Agent Loop 会同步调用大模型（方舟推理模型单次决策需数十秒），若放在 HTTP 请求内同步跑，
+# 会远超前端 axios 10s / Vite 代理 120s 超时。改为后台线程执行、立即返回会话，
+# 前端轮询 GET /agent/sessions/{id} 获取实时步骤。
+def _spawn_loop(method: str, session, user, app_id: int, **kw):
+    def _task():
+        bg_db = SessionLocal()
+        try:
+            ctx = _make_ctx(bg_db, user, app_id)
+            ctx.session = session
+            loop = AgentLoop()
+            if method == "start":
+                loop.start(session, ctx)
+            elif method == "approve":
+                loop.approve(session, kw["step_id"], kw["approved"],
+                             kw.get("reason"), ctx)
+            elif method == "message":
+                loop.send_message(session, kw["text"], ctx)
+            # —— 中途改向续跑：用户在 Agent 运行中发新指令，旧循环退出后按新方向重跑 ——
+            while True:
+                redirect = getattr(session, "pending_redirect", None)
+                if not redirect:
+                    break
+                session.pending_redirect = None
+                loop.redirect_run(session, ctx, redirect)
+        except Exception as e:  # 异常落到会话上，前端轮询可见
+            session.status = "failed"
+            try:
+                session.add_step(AgentStep(
+                    kind=AgentStepKind.FINAL.value,
+                    text=f"Agent 执行异常：{e}",
+                    status=AgentStepStatus.FAILED.value))
+            except Exception:
+                pass
+        finally:
+            bg_db.close()
+    threading.Thread(target=_task, daemon=True).start()
+
+
+# ----------------------------- SSE 流式辅助 ----------------------------- #
+def _sse(event: str, data: dict) -> str:
+    """序列化为一条 SSE 消息。"""
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def _authenticate(token: Optional[str], authorization: Optional[str], db: Session) -> User:
+    """SSE 鉴权：token 可来自 query（EventSource 无法自定义 Header）或 Authorization Header。"""
+    raw = token
+    if not raw and authorization:
+        raw = authorization[7:] if authorization.startswith("Bearer ") else authorization
+    if not raw:
+        raise HTTPException(status_code=401, detail="未提供认证凭据")
+    payload = decode_token(raw)
+    if not payload or not payload.get("sub"):
+        raise HTTPException(status_code=401, detail="认证无效或已过期")
+    user = db.query(User).filter(User.email == payload["sub"]).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="用户不存在")
+    return user
+
+
 # ----------------------------- 路由 ----------------------------- #
 @router.post("/sessions")
 def create_session(
@@ -63,14 +131,10 @@ def create_session(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """创建 Agent 会话并启动 ReAct 循环。"""
+    """创建 Agent 会话并异步启动 ReAct 循环（立即返回，进度由前端轮询）。"""
     store = get_session_store()
     session = store.create(app_id=req.app_id, user_id=current_user.id, goal=req.text)
-    ctx = _make_ctx(db, current_user, req.app_id)
-    ctx.session = session
-
-    loop = AgentLoop()
-    loop.start(session, ctx)
+    _spawn_loop("start", session, current_user, req.app_id)
     return session
 
 
@@ -99,6 +163,78 @@ def get_session(
     return session
 
 
+@router.get("/sessions/{session_id}/stream")
+async def stream_session(
+    session_id: str,
+    token: Optional[str] = Query(None, description="SSE 鉴权 token（EventSource 无法自定义 Header，故走 query）"),
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    """SSE 流式推送会话步骤：连接即发 snapshot，之后每当 Agent Loop 产生新步骤/状态变化即推送。
+
+    前端用 EventSource 订阅，实现"边跑边显示"的实时明细流（thought/observation/action/approval/final），
+    避免整轮 Agent Loop（真调大模型需数分钟）跑完才一次性返回。
+    """
+    _authenticate(token, authorization, db)
+    store = get_session_store()
+    session = store.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    async def event_gen():
+        last = 0
+        last_status = session.status
+        # 跟踪每个 step 的文本长度 + 状态，用于检测"思考步骤内容增长"并重发
+        step_sig: Dict[str, tuple] = {}
+        # 初始快照：让前端立即拿到已有步骤与状态
+        yield _sse("snapshot", {
+            "steps": [s.model_dump() for s in session.steps],
+            "status": session.status,
+        })
+        for st in session.steps:
+            step_sig[st.id] = (len(st.text), st.status)
+        yield _sse("status", {"status": session.status})
+        heartbeat = 0
+        max_iter = int(30 * 60 / 0.3)  # 安全上限：约 30 分钟，防连接泄漏
+        while heartbeat < max_iter:
+            s = store.get(session_id)
+            if s is None:
+                break
+            steps = s.steps
+            # 1) 新增步骤：逐条推送
+            if len(steps) > last:
+                for st in steps[last:]:
+                    yield _sse("step", st.model_dump())
+                    step_sig[st.id] = (len(st.text), st.status)
+                last = len(steps)
+            # 2) 已有步骤内容/状态变化（如思考步骤流式增长）：重发该 step
+            for st in steps:
+                sig = (len(st.text), st.status)
+                if step_sig.get(st.id) != sig:
+                    step_sig[st.id] = sig
+                    yield _sse("step", st.model_dump())
+            if s.status != last_status:
+                last_status = s.status
+                yield _sse("status", {"status": s.status})
+            if s.status in ("done", "failed"):
+                yield _sse("end", {"status": s.status})
+                break
+            heartbeat += 1
+            if heartbeat % 10 == 0:
+                yield ": keepalive\n\n"
+            await asyncio.sleep(0.3)
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # 关闭下游代理缓冲（如 nginx）
+        },
+    )
+
+
 @router.post("/sessions/{session_id}/approve")
 def approve_step(
     session_id: str,
@@ -106,19 +242,12 @@ def approve_step(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """人在环审批一个待确认动作；批准后 Agent 续跑，驳回后重新规划。"""
+    """人在环审批一个待确认动作；批准后 Agent 异步续跑，驳回后重新规划（立即返回）。"""
     store = get_session_store()
     session = store.get(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    ctx = _make_ctx(db, current_user, session.app_id)
-    ctx.session = session
-    loop = AgentLoop()
-    try:
-        loop.approve(session, req.step_id, req.approved, req.reason, ctx)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
     # 若是主动自治生成的提案，回写关联告警状态（前端告警流随之更新）
     try:
         update_alert_for_session(
@@ -126,6 +255,10 @@ def approve_step(
             "已批准，Agent 续跑" if req.approved else f"已驳回（{req.reason or '用户拒绝'}）")
     except Exception:
         pass
+
+    session.status = "running"  # 立即返回 running，驱动前端轮询续跑进度
+    _spawn_loop("approve", session, current_user, session.app_id,
+                step_id=req.step_id, approved=req.approved, reason=req.reason)
     return session
 
 
@@ -136,17 +269,53 @@ def send_message(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """向 Agent 追加指令 / 多轮追问。"""
+    """向 Agent 追加指令 / 多轮追问（异步执行，立即返回）。"""
     store = get_session_store()
     session = store.get(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    ctx = _make_ctx(db, current_user, session.app_id)
-    ctx.session = session
-    loop = AgentLoop()
-    loop.send_message(session, req.text, ctx)
+    session.status = "running"  # 立即返回 running，驱动前端轮询
+    _spawn_loop("message", session, current_user, session.app_id, text=req.text)
     return session
+
+
+@router.post("/sessions/{session_id}/abort")
+def abort_session(
+    session_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """中断当前运行中的 Loop（优雅停机，保留已完成步骤）。"""
+    store = get_session_store()
+    session = store.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    session.abort_requested = True
+    return {"ok": True, "status": session.status}
+
+
+@router.post("/sessions/{session_id}/redirect")
+def redirect_session(
+    session_id: str,
+    req: MessageRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """中途改向：中断当前运行中的 Loop，并按新指令重启一轮 ReAct（立即返回）。
+
+    仅置 abort + pending_redirect 标志；正在跑的 Loop 退出后，
+    由 _spawn_loop 的续跑循环接管并按新方向续跑（SSE 同会话 id 无缝续推）。
+    """
+    store = get_session_store()
+    session = store.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if session.status != "running":
+        raise HTTPException(status_code=400, detail="仅运行中的会话可改向")
+    session.abort_requested = True
+    session.pending_redirect = req.text
+    return {"ok": True, "status": session.status, "pending_redirect": req.text}
 
 
 # ----------------------------- Phase 2：反思端点 ----------------------------- #

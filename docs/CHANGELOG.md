@@ -1,5 +1,53 @@
 # 更新日志
 
+## v1.7.0 - 2026-07-11 — ark 推理服务对接 & 流式展示 & 外部检索
+
+> 本版本将智能体控制台从「桩式规则引擎」升级为「真实大模型驱动的流式 Agent」，并完成两项关键能力补全：**可打断**、**外部市场检索**。
+
+### Added（新增）
+
+- **火山引擎方舟（Volcengine Ark）推理服务对接**
+  - `config.py` 新增 `ark_api_key / ark_model / ark_base_url`（默认 `https://ark.cn-beijing.volces.com/api/v3`）；`get_llm_providers_config()` 注册 `ark` provider（priority=1，capabilities 含 complex_intent / strategy_analysis / creative_generation / fast_response），并将 `campaign.optimize_batch`、`creative.rotate` 首选路由到 ark（分别降级 claude / gpt4）。
+  - `router.py` 新增 `ArkProvider`：基于 `httpx.AsyncClient` 调 `{base_url}/chat/completions`，Bearer 鉴权，解析 `choices[0].message.content` 与 `reasoning_content`；注册进 `provider_classes`；经本地代理出网、超时放宽（`timeout=120~180s`，支持推理模型长思考）。
+  - `main.py` lifespan 启动期即 `get_llm_router(...)` 初始化——修复此前 router 仅在 llm 端点命中时才初始化、导致 Agent Loop 永远落到规则兜底的漏洞。
+  - 端到端真实调用验证通过（Endpoint `ep-xxxx`，`usage.reasoning_tokens=4243` 证实为推理模型）。
+
+- **智能体思考过程流式展示（SSE）**
+  - 后端新增 `GET /agent/sessions/{id}/stream`（`StreamingResponse text/event-stream`）：连接即推 `snapshot` + `status`，之后每 0.3s 增量推 `step` / `status` / `end`，安全上限 ~30min 防连接泄漏；token 经 query 兼容 EventSource（无法自定义 Header）。
+  - Agent Loop 后台线程化（`_spawn_loop` + `threading.Thread(daemon=True)`）：`create_session / approve_step / send_message` 立即返回 `status=running`，前端经 SSE 实时拉步骤——解决 axios 10s / Vite 120s 超时导致的「启动失败」。
+  - 思考过程实时流式：`AgentStepKind` 新增 `REASONING`（🧠），`ArkProvider.chat_completion` 支持 `stream=True` 逐行解析 OpenAI SSE 的 `reasoning_content` / `content` delta；`loop.py` 累积进 `REASONING` 步骤并实时定稿；前端 `StepView` 新增 `reasoning` 分支（紫色卡片、可滚动、思考中 Spin），SSE `step` 事件按 id 原地合并更新支持文本增长。
+  - `vite.config.js` 代理 `/api` 关闭缓冲（`cache-control: no-transform` + `x-accel-buffering: no`），保证 SSE 逐条下发。
+
+- **外部市场检索能力**
+  - 新增 `market_research` 工具（Tool Registry，L0 / read）：真实网络检索（经代理 DuckDuckGo）优先 + 内置 `BENCHMARK_DB` 行业基准库兜底，覆盖 品类 × 国家 × 渠道 的 CPI / CPA / ROAS。
+  - system prompt 强约束：凡涉及行业基线 / 竞品 CPI / 市场调研 / benchmark，**必须第一步调用 `market_research`**，禁止只依赖平台内部账户数据（带 few-shot）。
+
+- **可打断 & 中途改向（人机协作 steering）**
+  - `AgentSession` 新增 `abort_requested` / `pending_redirect` 字段。
+  - 思考中可即时「停止」：`loop.py` 在流式 token 间做细粒度 `abort_requested` 检查（下一个 token 即 `aclose()` 退出），终态「已根据您的指示中断」。
+  - 运行中发新消息走「改向继续」：`redirect_run()` 中断旧 Loop → 注入「🔀 用户中途改向」步骤 → 以新目标续跑。
+  - 新增 API：`POST /agent/sessions/{id}/abort`、`POST /agent/sessions/{id}/redirect`。
+  - 前端输入区在 `running` 时显示红色「停止」+「改向继续」按钮。
+
+### Changed（变更）
+
+- LLM 路由默认策略：ark 作为首选 provider，规则引擎仅作最终兜底。
+- 智能体控制台数据流：由 2.5s 轮询升级为 SSE 实时流式。
+
+### Fixed（修复）
+
+- 修复「启动智能体」前端报「启动失败」：同步跑完整 Agent Loop 触发前端 axios 10s 超时；改为后台线程 + 立即返回 running。
+- 修复方舟 `reasoning_content` 被丢弃（仅抓 `content`），导致看不到 agent 思考过程：补齐流式 Reasoning 链路。
+- 修复 `abort` 不即时生效：旧 Loop 卡在单次长推理调用，改为流式 token 级细粒度中断检查。
+- 前端热修复：`App.jsx` 补 `import AgentConsole`；`BrainOutlined`（不存在）→ `AimOutlined`；`api.js` 删除重复 `approve` shorthand 避免模块加载白屏。
+
+### Docs（文档）
+
+- `docs/AGENTIC_AD_PLATFORM_UPGRADE.md`：Agentic 平台升级方案（Phase 0~4）。
+- `docs/SCALING_UPGRADE.md`：多用户并发扩展实施清单。
+- `backend/.env` 加入 `.gitignore`（含方舟 Key，避免误提交）。
+---
+
 ## v1.6.0 - 2026-07-10
 
 > 本期核心：**Phase 4 主动式自治（Proactive Autonomy）**。Agent 从"人召唤才动"升级为
@@ -336,6 +384,12 @@
 - [x] Phase 2 记忆与反思（Episodic Memory + Reflection）
 - [x] Phase 3 策略自演化（StrategyStore 落盘、跨账户迁移）
 - [x] 前端「智能体控制台」对接（多轮对话 / 审批 / 记忆 / 策略 / 复盘）
+
+### ✅ v1.7.0 (已完成, 2026-07-11) — Ark 推理对接 & 流式展示 & 外部检索
+- [x] 火山方舟 Ark 推理服务对接（router provider + 启动期初始化）
+- [x] SSE 实时流式思考过程（reasoning_content 逐 token 呈现）
+- [x] 外部市场检索 market_research 工具（真实检索 + 基准库兜底）
+- [x] 可打断 & 中途改向（abort / redirect 人机协作 steering）
 
 ### ✅ v1.6.0 (已完成, 2026-07-10) — Phase 4 主动式自治
 - [x] APScheduler 周期巡检 + 5 类异常检测（CPI/ROI/疲劳/花费/账户被封）

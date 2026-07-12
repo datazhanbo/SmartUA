@@ -21,7 +21,8 @@ def _now() -> str:
 
 
 class AgentStepKind(str, Enum):
-    THOUGHT = "thought"        # 推理过程（可解释）
+    REASONING = "reasoning"    # 大模型思考过程（推理模型的 reasoning_content，逐 token 流式）
+    THOUGHT = "thought"        # 推理结论（模型在 JSON 中给出的 thought 摘要）
     ACTION = "action"          # 已执行的写动作
     OBSERVATION = "observation"  # 读/观察结果
     APPROVAL = "approval"      # 待人确认的高风险动作
@@ -34,6 +35,7 @@ class AgentStepStatus(str, Enum):
     REJECTED = "rejected"
     EXECUTED = "executed"
     FAILED = "failed"
+    THINKING = "thinking"      # 大模型正在流式思考中（reasoning 步骤）
     DONE = "done"              # 观察/结论已落定
 
 
@@ -51,6 +53,7 @@ class AgentStep(BaseModel):
 
     def short(self) -> str:
         tag = {
+            AgentStepKind.REASONING.value: "🧠",
             AgentStepKind.THOUGHT.value: "💭",
             AgentStepKind.OBSERVATION.value: "👁",
             AgentStepKind.ACTION.value: "✅",
@@ -73,6 +76,8 @@ class AgentSession(BaseModel):
     context: Dict[str, Any] = Field(default_factory=dict)  # 累计观察（如最近一次 summary）
     created_at: str = Field(default_factory=_now)
     updated_at: str = Field(default_factory=_now)
+    abort_requested: bool = False            # 用户请求中断当前循环
+    pending_redirect: Optional[str] = None    # 用户中途改向：中断后按此新指令续跑
 
     def add_step(self, step: AgentStep) -> AgentStep:
         self.steps.append(step)

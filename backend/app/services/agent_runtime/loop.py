@@ -33,6 +33,7 @@ class Decision:
     action: Optional[str] = None
     params: Dict[str, Any] = field(default_factory=dict)
     thought: str = ""
+    reasoning: str = ""      # 大模型思考过程（推理模型的 reasoning_content）
     final: bool = False
     text: str = ""
 
@@ -87,6 +88,17 @@ class AgentLoop:
         session.status = "running"
         return self._run(session, ctx)
 
+    def redirect_run(self, session: AgentSession, ctx: AgentContext, text: str) -> AgentSession:
+        """中途改向：清除中断标志，把新指令注入目标，开启新一轮 ReAct。"""
+        session.abort_requested = False
+        session.goal = (session.goal or "") + f"\n[用户改向] {text}"
+        session.add_step(AgentStep(
+            kind=AgentStepKind.OBSERVATION.value,
+            text=f"🔀 用户中途改向：{text}",
+            status=AgentStepStatus.DONE.value))
+        session.status = "running"
+        return self._run(session, ctx)
+
     def reflect(self, ctx: AgentContext, goal: Optional[str] = None):
         """复盘：基于已沉淀的 Episode 记忆，提取启发式规则（Phase 2 反思层）。"""
         from app.services.agent_runtime.reflection import Reflector
@@ -104,6 +116,12 @@ class AgentLoop:
     def _run(self, session: AgentSession, ctx: AgentContext) -> AgentSession:
         max_steps = settings.agent_max_steps
         while session.status == "running":
+            # —— 用户中断检查（停止 / 中途改向）——
+            if session.abort_requested:
+                if not session.pending_redirect:
+                    self._interrupted(session, ctx)
+                break
+
             acted = [s for s in session.steps
                      if s.kind in (AgentStepKind.ACTION.value, AgentStepKind.OBSERVATION.value,
                                    AgentStepKind.APPROVAL.value)]
@@ -116,6 +134,11 @@ class AgentLoop:
                 break
 
             decision = self._decide(session, ctx)
+            # 决策刚产生即被中断：不执行、不定稿原结论，直接停机（除非是要改向）
+            if session.abort_requested:
+                if not session.pending_redirect:
+                    self._interrupted(session, ctx)
+                break
             if decision.final:
                 session.add_step(AgentStep(
                     kind=AgentStepKind.FINAL.value, text=decision.text,
@@ -127,6 +150,18 @@ class AgentLoop:
             if session.status == "awaiting_approval":
                 break
         return session
+
+    def _interrupted(self, session: AgentSession, ctx: AgentContext):
+        """用户请求中断：保留已完成步骤，输出中断终态。仅当无 pending_redirect 时调用。"""
+        session.add_step(AgentStep(
+            kind=AgentStepKind.OBSERVATION.value,
+            text="⏹ 用户请求中断，已停止当前循环。以上为已完成的步骤；如需我继续，请说明新的方向。",
+            status=AgentStepStatus.DONE.value))
+        session.add_step(AgentStep(
+            kind=AgentStepKind.FINAL.value,
+            text="已根据您的指示中断。",
+            status=AgentStepStatus.DONE.value))
+        session.status = "done"
 
     def _dispatch(self, session: AgentSession, ctx: AgentContext, decision: Decision):
         tool = self.registry.get(decision.action)
@@ -212,29 +247,82 @@ class AgentLoop:
             "风险分级：L0 自动执行；L1/L2 必须走人在环审批——你只需'提议'，不要自行判定审批结果。\n"
             "每一步只输出一个 JSON（不要多余文字）：\n"
             '  {"thought":"..","action":"工具名","params":{...}}\n'
-            '  {"thought":"..","final_answer":"结论文本"}\n'
-            "若需要了解账户现状，先调用 observe_campaigns。"
+            '  {"thought":"..","final_answer":"结论文本"}\n\n'
+            "【外部数据检索（重要）】\n"
+            "当问题涉及**行业基线 / 竞品 CPI / CPA / ROAS / 市场调研 / benchmark / 市场角度**时，"
+            "你必须**第一步就调用 `market_research`** 获取外部视角，**禁止只依赖平台内部账户数据作答**。\n"
+            "示例：用户问\"ai视频剪辑工具 meta us cpi baseline\" → 先 "
+            'market_research(query="ai video editing app CPI benchmark US Meta")，'
+            "再结合返回的行业标准给出判断。\n"
+            "若需要了解账户现状，调用 observe_campaigns。"
         )
         messages = [{"role": "system", "content": sys_prompt}]
         if history:
             messages.append({"role": "user", "content": "已发生：\n" + "\n".join(history)})
         messages.append({"role": "user", "content": f"目标：{session.goal}\n请决定下一步。"})
 
-        result = await router.chat_completion(
-            "campaign.optimize_batch", messages, data_sensitivity="low")
-        if result.get("fallback_mode") or not result.get("content"):
-            return None
+        # 先建一个"思考中"占位步骤，让前端立即看到 Agent 进入推理；随后流式填充思考过程
+        rstep = session.add_step(AgentStep(
+            kind=AgentStepKind.REASONING.value,
+            text="🤔 正在调用大模型进行推理…",
+            status=AgentStepStatus.THINKING.value))
 
-        content = result["content"]
-        js = _extract_json(content)
-        if not js:
+        try:
+            result = await router.chat_completion(
+                "campaign.optimize_batch", messages, data_sensitivity="low", stream=True)
+
+            reasoning_buf: List[str] = []
+            content_buf: List[str] = []
+            is_stream = hasattr(result, "__aiter__")
+            if is_stream:
+                try:
+                    async for chunk in result:
+                        ctype = chunk.get("type")
+                        if ctype == "reasoning":
+                            reasoning_buf.append(chunk.get("text", ""))
+                            rstep.text = "🤔 思考中…\n\n" + "".join(reasoning_buf)
+                        elif ctype == "content":
+                            content_buf.append(chunk.get("text", ""))
+                        # 流式细粒度中断：用户点"停止"时，下一个 token 即可退出当前推理
+                        if session.abort_requested:
+                            rstep.text = "🤔 思考中…（已被用户中断）\n\n" + "".join(reasoning_buf)
+                            rstep.status = AgentStepStatus.DONE.value
+                            return Decision(final=True, text="（推理已被您中断，等待下一步指令）")
+                finally:
+                    if hasattr(result, "aclose"):
+                        try:
+                            await result.aclose()
+                        except Exception:
+                            pass
+                rstep.text = "".join(reasoning_buf) or "（模型未返回显式思考过程）"
+                rstep.status = AgentStepStatus.DONE.value
+                content = "".join(content_buf)
+            else:
+                if result.get("fallback_mode") or not result.get("content"):
+                    # 无可用 LLM：撤销思考占位步骤，退回规则引擎
+                    if session.steps and session.steps[-1] is rstep:
+                        session.steps.pop()
+                    return None
+                reasoning_buf.append(result.get("reasoning") or "")
+                rstep.text = result.get("reasoning") or "（模型未返回显式思考过程）"
+                rstep.status = AgentStepStatus.DONE.value
+                content = result.get("content") or ""
+
+            js = _extract_json(content)
+            if not js:
+                rstep.text = (rstep.text or "") + "\n\n（模型未返回可解析的 JSON 决策，已退回规则引擎）"
+                return None
+            if "final_answer" in js:
+                return Decision(final=True, text=js["final_answer"], reasoning="".join(reasoning_buf))
+            if "action" in js:
+                return Decision(action=js.get("action"), params=js.get("params", {}) or {},
+                                 thought=js.get("thought", ""), reasoning="".join(reasoning_buf))
             return None
-        if "final_answer" in js:
-            return Decision(final=True, text=js["final_answer"])
-        if "action" in js:
-            return Decision(action=js.get("action"), params=js.get("params", {}) or {},
-                             thought=js.get("thought", ""))
-        return None
+        except Exception as e:
+            # 推理调用异常：定稿思考步骤，退回规则引擎
+            rstep.text = f"🤔 思考中…\n\n（推理调用异常：{e}）"
+            rstep.status = AgentStepStatus.DONE.value
+            return None
 
     # ============================ 规则引擎兜底 ============================ #
     def _rule_based_decide(self, session: AgentSession, ctx: AgentContext) -> Decision:
