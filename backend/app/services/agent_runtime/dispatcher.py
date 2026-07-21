@@ -229,6 +229,7 @@ class Dispatcher:
         matched, reason = _verify_state(current, req)
         if matched:
             self._store.transition(db, action, "verified")
+            _enqueue_impact_jobs(db, action)
             return DispatchOutcome(action=action, state="verified",
                                     provider_response=provider_response,
                                     observation=f"verified: {reason}")
@@ -272,6 +273,7 @@ class Dispatcher:
         matched, reason = _verify_state(current, req)
         if matched:
             self._store.transition(db, action, "verified")
+            _enqueue_impact_jobs(db, action)
             return DispatchOutcome(action=action, state="verified",
                                     provider_response=action.provider_response_json,
                                     observation=f"reconciled → verified: {reason}")
@@ -287,6 +289,18 @@ class Dispatcher:
 
 
 _dispatcher: Optional[Dispatcher] = None
+
+
+def _enqueue_impact_jobs(db: Session, action: AgentActionDB) -> None:
+    """Phase 4.2 —— 动作 verified 后 enqueue observed/attributed × 2h/24h/7d 六条 job。
+
+    失败不影响主 dispatcher 流程（Loop 已 commit 了 verified 状态）。
+    """
+    try:
+        from app.services.agent_runtime.impact_collector import enqueue_after_verified
+        enqueue_after_verified(db, action)
+    except Exception as e:
+        logger.warning("enqueue impact jobs for action %s failed: %s", action.id, e)
 
 
 def get_dispatcher() -> Dispatcher:

@@ -232,32 +232,44 @@ def _rotate(params: Dict, ctx: AgentContext) -> ToolResult:
 
 
 # --------------------------------------------------------------------------- #
-# 影响评估（回填 impact_*）
+# 影响评估（Phase 4.1 起：仅生产 predicted envelope；observed / attributed
+# 由 Phase 4.2 延迟回采任务写入 —— 缺回采就保持 NULL，不用 0 冒充。）
 # --------------------------------------------------------------------------- #
 def _compute_impact(ctx: AgentContext, action: str, entity_id: str,
                     ap: Dict) -> Dict[str, Any]:
-    """用引擎的反事实克隆评估动作影响（不污染共享状态）。"""
+    """用引擎的反事实克隆生成三档预测 envelope（2h / 24h / 7d）。
+
+    返回值形状是**兼容**的：既保留了 `impact_2h/24h/7d` 三个键让老消费者
+    （EpisodicMemory / IntentExecution.impact_*_json / 前端）继续能读，
+    也在每一个 envelope 里带上 `kind="predicted"` + provenance —— Phase 4.3
+    学习门禁凭此判断"这只是预测，不能算做真实样本"。
+    """
+    from app.services.agent_runtime.impact import make_predicted
+
     try:
         eff = ctx.connector.simulate_impact(action, entity_id, ap, horizon=7)
     except Exception:
         return {}
     d_roi, d_spend, d_cpi = eff.delta_roi, eff.delta_spend, eff.delta_cpi
     avg = lambda xs: round(sum(xs) / len(xs), 4) if xs else 0.0
+    src = getattr(ctx.connector, "platform", "mock")
+    currency = "USD"
+
     return {
-        "impact_2h": {
-            "delta_roi": round((d_roi[0] if d_roi else 0) * (2 / 24), 4),
-            "note": "daily sim; 2h 为线性外推近似",
-        },
-        "impact_24h": {
-            "delta_roi": round(d_roi[0], 4) if d_roi else 0,
-            "delta_spend": round(d_spend[0], 2) if d_spend else 0,
-            "delta_cpi": round(d_cpi[0], 4) if d_cpi else 0,
-        },
-        "impact_7d": {
-            "avg_delta_roi": avg(d_roi),
-            "avg_delta_spend": avg(d_spend),
-            "avg_delta_cpi": avg(d_cpi),
-        },
+        "impact_2h": make_predicted(
+            {"delta_roi": round((d_roi[0] if d_roi else 0) * (2 / 24), 4),
+             "note": "daily sim; 2h 为线性外推近似"},
+            window="2h", source=f"simulate_impact/{src}", currency=currency),
+        "impact_24h": make_predicted(
+            {"delta_roi": round(d_roi[0], 4) if d_roi else 0,
+             "delta_spend": round(d_spend[0], 2) if d_spend else 0,
+             "delta_cpi": round(d_cpi[0], 4) if d_cpi else 0},
+            window="24h", source=f"simulate_impact/{src}", currency=currency),
+        "impact_7d": make_predicted(
+            {"avg_delta_roi": avg(d_roi),
+             "avg_delta_spend": avg(d_spend),
+             "avg_delta_cpi": avg(d_cpi)},
+            window="7d", source=f"simulate_impact/{src}", currency=currency),
     }
 
 

@@ -1,5 +1,111 @@
 # 更新日志
 
+## 未发布 - 2026-07-22 — 生产升级 Phase 4.2 延迟回采（observed / attributed 从事实表回填）
+
+### Added（新增）
+
+- **`AgentImpactJobDB`（`agent_impact_jobs` 表，Alembic revision `6aff1c23d194`）**：动作 verified 后待回采的 impact job 队列。
+  - 字段：`id / action_id (FK) / app_id / kind (observed|attributed) / window (2h|24h|7d) / scheduled_at / executed_at / status (scheduled|running|done|failed|skipped) / envelope_json / error`。
+  - 约束：`(action_id, kind, window)` UNIQUE（同一动作同一 kind 同一 window 只入队一次）；`(status, scheduled_at)` 复合索引，到点扫描 O(log n)。
+- **`backend/app/services/agent_runtime/impact_collector.py`**：延迟回采的核心模块。
+  - `enqueue_after_verified(db, action, now=None)`：动作转移到 verified 时调用，一次生成 6 条 job（observed × 3 + attributed × 3）；`scheduled_at = (verified_at or accepted_at) + {2h, 24h, 7d}`；无 `entity_id` 或重复入队直接跳过。
+  - `run_due_jobs(db, now=None, limit=200)`：拾起所有 `status="scheduled" AND scheduled_at ≤ now` 的 job；聚合 pre/post 窗口 → 计算 delta → 写回 `AgentActionDB.observed_impact_json` / `attributed_impact_json` + `AgentImpactJobDB.envelope_json`。返回 `{done, empty, failed}` 计数。
+  - 窗口对齐：日粒度事实表 → 日对齐窗口 `pre=[action_day-7, action_day)`, `post=[action_day, action_day+window_days)`。
+  - 日均口径 delta：避免不同长度窗口（7d baseline vs 1d post）直接求和误比较。
+  - `now` 参数注入时钟，测试可任意伪造；生产由外部调度器周期性调用。
+- **`Dispatcher._verify` / `Dispatcher.reconcile` 挂钩**：状态转移到 `verified` 后自动调 `_enqueue_impact_jobs`；try/except 包裹，enqueue 失败不影响主 dispatcher 流程（已 commit 的 verified 状态不会被回滚）。
+- **`backend/tests/test_impact_collector.py`**：9 项单元测试。
+  - Enqueue 语义：6 条 job / 无 entity_id 跳过 / 重复调用幂等。
+  - 时序：未到点跳过（30 min）/ 2h 到点但 24h & 7d 未到点。
+  - Observed 真实数据：FactMediaDaily 填 3 行 pre + 1 行 post，envelope `metrics.delta_spend > 0` / `delta_installs > 0` / `source = google` / `completeness = 1.0`。
+  - Attributed 真实数据：FactMMPDaily pre ROI 0.03 → post ROI 0.10，`delta_roi ≈ 0.07`，`delta_installs > 0`，`source = appsflyer_mmp`。
+  - **核心不变量**：`test_observed_empty_when_no_fact_rows` —— 事实表 0 行 → envelope `metrics={} && completeness=0.0`，禁止用 0 冒充有效果。
+  - `run_due_jobs` 多次调用幂等：done 状态的 job 不会被重复处理。
+
+### Changed（变更）
+
+- **`tests/test_migration.py`**：`_HEAD_REVISION` → `6aff1c23d194`，`_KNOWN_TABLES` 34 → 35。
+- **`app/models/agent_runtime.py`**：新增 `AgentImpactJobDB`，向 Base metadata 注册。
+
+### Rationale（设计原因）
+
+- **为什么 6 条 job 而不是"1 条动作 → 1 条汇总记录"**：observed 与 attributed 来自不同数据源（媒体报表 vs MMP），可用时间也不同 —— Media 数据通常 1h 内到位，MMP 数据可能延迟到 D+3。分开 enqueue 允许"observed 已回采、attributed 还在等"共存，避免"两者其一延迟就整条不落"的死锁。
+- **为什么日均口径 delta**：7d baseline vs 1d 观测窗口的绝对求和无法直接比较（"post = 200 vs pre = 300" 不代表放量下降，可能只是窗口更短）。日均比率是最小可比单位；后续 Phase 7 想引入 matched control / DiD 时再改。
+- **为什么事实表 0 行 → `completeness=0.0` 而不是删 job**：`envelope.kind` 字段本身携带"我们尝试回采过了"的信号；`completeness=0.0` 让消费者（Phase 4.3 学习门禁）明确区分"未回采"和"已回采但数据缺失"。删 job 会让"这个动作有没有回采过"变得不可知。
+- **为什么 dispatcher 挂钩用 try/except**：`_enqueue_impact_jobs` 失败（例如 `AgentImpactJobDB` 表被误删）不能把 `verified` 状态回滚 —— 状态机与回采是弱耦合，回采可以后续手动补，状态机不能"半 verified"。
+- **为什么当前只覆写 AgentActionDB 不同步 IntentExecution**：`IntentExecution.observed_impact_json / attributed_impact_json` 面向产品审计层的读用户；策略学习（Phase 4.3）只读 AgentActionDB。Phase 4.3 触发学习时按需回填 IntentExecution，避免每次回采都双写。
+- **为什么现在还不用 durable worker（Phase 5.2）**：本阶段 collector 与 dispatcher 都是同步单进程；生产验证等 Phase 5.2 建成 job queue + worker 后再改为异步消费。当前实现足以覆盖单机 Mock 验证与"单进程定时调 `run_due_jobs`" 的 v1.8.x 上线目标。
+
+### Validation（验证）
+
+- `python3 -m pytest tests/ -q`：**123 项全部通过**（114 → 123，新增 9 项 Phase 4.2 测试）。既有 114 项零回归。
+- `python3 -m alembic upgrade head`：临时 SQLite 从 `eaa540e8896a` 升级到 `6aff1c23d194` 成功。
+- `python3 -m alembic check`：schema 与模型完全一致，无遗漏差异。
+- `test_migration.py`：空库 upgrade / stamp / data-preserved / schema-完整性 全部通过（35 表匹配）。
+- 关键不变量断言（`test_impact_collector.py`）：
+  - `test_observed_empty_when_no_fact_rows`：事实表 0 行时 envelope 存在但 `metrics={}, completeness=0.0`（不冒充 0 delta）。
+  - `test_enqueue_creates_six_jobs`：verified 动作准确生成 6 条 job，scheduled_at 精确对齐 `verified_at + {2h, 24h, 7d}`。
+  - `test_run_due_jobs_is_idempotent`：done 状态 job 再跑一次是 no-op。
+  - `test_2h_window_runs_but_7d_still_pending`：时序精确 —— 3h 时只有 2h window 到点，24h/7d 保持 scheduled。
+
+### 已知遗留 / 阻塞
+
+- **未接生产调度器**：`run_due_jobs` 需要外部（APScheduler / cron）周期性调用；当前只在测试中显式触发。生产接入等 Phase 5.2 durable worker。
+- **多副本双跑风险**：single-process 前提下没问题，多副本时同 job 可能被两个 worker 同时拾起；Phase 5.4 独立调度 + DB 唯一租约解决。
+- **粒度限制**：目前只按 campaign_id 回采；adset/ad/creative 粒度动作暂不支持，等 Phase 6 只读能力扩充时改按 entity_level 匹配。
+- **基线只是简单日均**：未做 matched control / DiD / 季节性调整，Phase 7 反思层再补真正的因果推断。
+- **无 live 事实数据验证**：所有测试用 Mock 事实表；真实 Google Reports / AppsFlyer 归因数据未接入 pipeline，需 Phase 6 只读工具与凭证配置到位后再补 live 验证。
+
+---
+
+## 未发布 - 2026-07-21 — 生产升级 Phase 4.1 三类影响拆分（predicted / observed / attributed）
+
+### Added（新增）
+
+- **`backend/app/services/agent_runtime/impact.py`**：三类影响的公共 envelope 定义。
+  - `ImpactEnvelope` 数据类，字段：`kind ∈ {predicted, observed, attributed}` / `metrics` / `window` / `time_zone` / `currency` / `source` / `freshness` / `completeness`。
+  - 构造器 `make_predicted / make_observed / make_attributed` —— 分别产出正确 kind + provenance；observed / attributed 的 `completeness` 若未指定则保持 None，**禁止用 0 冒充**。
+  - `metric(env, key, default=None)` 安全取指标：`env is None` / 缺 metrics 键 → 返回 default。消费方约定：想读 observed 就传 observed envelope，不许自动 fallback predicted。
+- **`AgentActionDB.observed_impact_json` / `attributed_impact_json`**（nullable）：动作生效后由 Phase 4.2 回采任务填入。原 `predicted_impact_json` 语义收紧为"仅预测"。
+- **`IntentExecution.observed_impact_json` / `attributed_impact_json`**（nullable）：保持 `impact_2h/24h/7d_json` 兼容既有前端 / 审计消费者，但语义严格为 predicted envelope。
+- **Alembic 迁移 `eaa540e8896a_phase4_1_split_impact_into_observed_and_`**：`agent_actions` 与 `intent_executions` 各加两列（均 nullable），既有数据零影响。
+- **`Episode.impact_kind(window)`**：Phase 4.3 学习门禁的钩子 —— 判断该 window envelope 是 `predicted` / `observed` / `attributed`。老 Episode（无 kind）返回 None。
+- **`backend/tests/test_impact_envelope.py`**：12 用例 —— envelope 构造器 provenance、`metric` 缺失返回 default、`from_dict` 空值处理、`tools._compute_impact` 产出三档 predicted envelope、Episode 兼容新 envelope + 老裸 dict、AgentActionDB 三类字段并存 + 默认 observed/attributed NULL 的不变量。
+
+### Changed（变更）
+
+- **`tools._compute_impact()`**：Phase 4.1 起返回三档 predicted envelope（`impact_2h/24h/7d`），source 记为 `simulate_impact/<platform>`，completeness 恒为 1.0（模型输入完备），freshness 记为生成时刻。**不再输出裸 metrics dict**。
+- **`memory.Episode._metric(window, key)`**：新旧格式同时兼容。新 envelope 走 `metrics.<key>`；老 Episode（Phase 3.x 之前）走 `env[<key>]`。都缺时返回 0.0。Phase 2 记忆层的 `suggest_budget_increase_cap` 等消费者继续可用，零回归。
+- **`memory.py` 模块文档**：明确 Episode.impact **只存"当时的预测"**，observed / attributed 走 AgentActionDB / IntentExecution 的新列，不与 Episode 混一起。
+- **`tests/test_migration.py::_HEAD_REVISION`** → `eaa540e8896a`。
+
+### Rationale（设计原因）
+
+- **为什么在 envelope 里放 provenance 而不是各建三张表**：三类影响只是"同一动作的不同证据来源"，共享 window / metrics / entity；拆成三张表会引入 JOIN 与"多张表都为空"的空值分支。envelope + `kind` 字段是更小的表面积，前端 / 审计 / 学习门禁都能凭 kind 分流。
+- **为什么完整性字段（completeness）必须允许 None**：MMP 数据延迟到位时，"我们只拿到 60% 的归因事件"和"归因事件是 0"是完全不同的事实。用 None 表示"未采到"，用 0 表示"采到了但确实是零" —— Phase 4.3 学习门禁凭此拒绝把"未采到"当有效样本。
+- **为什么保留 `IntentExecution.impact_2h/24h/7d_json`**：这些字段在 Phase 3.x 已有大量历史消费者（前端、审计导出、Episode 生成）。拆列会牵动 UI 与 API 契约；用 envelope 的 `kind` 区分足以承担 predicted vs observed 的语义边界。真正需要独立通道的 observed / attributed 走**新列**，避免历史表爆炸。
+- **为什么 Episode 只保存 predicted**：Episode 是"动作发生时的世界状态 + 决策依据"的快照；observed / attributed 属于"事后事实"，走 AgentActionDB 更符合语义。这条边界会在 Phase 4.3（学习门禁）显著简化 "本次 Episode 是否可训练" 的判断。
+- **迁移只加列不改写老数据**：保持 SQLite 迁移的"零回滚风险"惯例。历史 predicted 数据仍是裸 dict；Episode 的 `_metric` 走兼容分支读通。若 Phase 4.2 需要统一 envelope 形态，另写一次性回填脚本，不放进本 Phase。
+
+### Validation（验证）
+
+- `python3 -m pytest tests/ -q`：**114 项全部通过**（102 → 114，新增 12 项 Phase 4.1 测试）。既有 102 项零回归。
+- `python3 -m alembic upgrade head`：真实 `smartua.db` 从 `49d2e70677ed` 升级到 `eaa540e8896a` 成功；`test_migration.py` 中空库 upgrade / stamp / data-preserved 三条路径均通过。
+- 关键不变量断言：
+  - `test_agent_action_defaults_observed_and_attributed_to_null`：新动作只写 predicted 时，observed / attributed **保持 NULL**（不冒充 0 / 空 envelope）。
+  - `test_make_observed_leaves_completeness_none_by_default`：未指定 completeness 时保持 None。
+  - `test_metric_missing_returns_default`：面对 None envelope / 缺 metrics 键，`metric()` 返回 default，绝不冒充有效果。
+- `tools._compute_impact()`：给固定 `simulate_impact` 输入后返回 3 个 envelope，每个 `kind == "predicted"`，metrics 数值精确匹配。
+
+### 已知遗留（进入 Phase 4.2 / 4.3）
+
+- **observed / attributed 尚无生产者**：目前只定义 schema 与 envelope；真实 Google/Meta/TikTok Reports 与 AppsFlyer MMP 的回采任务是 Phase 4.2。
+- **Reflector / StrategyStore 仍从 predicted 学**：`avg_delta_roi_7d` 等聚合仍读 Episode.impact（predicted）。Phase 4.3 学习门禁完成前，策略学习**是从 predicted 学 predicted** —— 这是明确的已知问题。
+- **`IntentExecution.impact_*_json` 未按 kind 拆列**：见 Rationale。envelope 内的 `kind` 已足够区分，Phase 4.3 消费方只需检查 kind 即可。
+- **历史数据没有 envelope 形态**：真实数据库里 Phase 3.x 的动作 `predicted_impact_json` 仍是裸 metrics dict。Episode 兼容分支能读通，但 Phase 4.2 若要按 envelope 消费需要一次一次性回填脚本。
+
+---
+
 ## 未发布 - 2026-07-21 — 生产升级 Phase 3.3 Dispatcher + 状态回读
 
 ### Added（新增）

@@ -126,7 +126,15 @@ class AgentActionDB(Base):
     request_json = Column(JSON, nullable=True)                 # 冻结的动作参数
     request_digest = Column(String(64), nullable=True)         # sha256(request_json)
     pre_state_json = Column(JSON, nullable=True)               # 动作前实体快照
-    predicted_impact_json = Column(JSON, nullable=True)        # 预测影响（不再冒充实际）
+    predicted_impact_json = Column(JSON, nullable=True)        # Phase 4.1: 严格只存"预测"，不再冒充实际
+    # Phase 4.1 —— 三类影响严格拆分：
+    # observed_impact_json：动作生效后从媒体侧读到的账面变化（Google/Meta/TikTok Reports）。
+    #   由 Phase 4.2 延迟回采任务在 2h/24h/7d 窗口填入；未回采完成前保持 NULL，不能用 0 冒充。
+    # attributed_impact_json：把变化归因到"本次动作"的部分（MMP、matched control、DiD）。
+    #   同样只在归因数据可用时写入；不可用则保持 NULL。
+    # 三个字段都遵循 impact.ImpactEnvelope 形状（kind/metrics/window/tz/currency/source/freshness/completeness）。
+    observed_impact_json = Column(JSON, nullable=True)
+    attributed_impact_json = Column(JSON, nullable=True)
     provider_request_id = Column(String(128), nullable=True)   # 媒体返回的请求 ID
     provider_response_json = Column(JSON, nullable=True)
     error = Column(Text, nullable=True)
@@ -141,4 +149,42 @@ class AgentActionDB(Base):
     __table_args__ = (
         UniqueConstraint("idempotency_key", name="uq_agent_actions_idempotency"),
         Index("ix_agent_actions_app_state", "app_id", "state"),
+    )
+
+
+# Phase 4.2 — 延迟回采（observed / attributed impact） -----------------------
+#
+# 动作 verified 之后，dispatcher enqueue 三条 job（2h / 24h / 7d）。
+# Collector（由外部定时器或 tests 直接调）到点后读 FactMediaDaily / FactMMPDaily，
+# 计算「动作前基线 vs 动作后窗口」的 delta，写回 AgentActionDB.observed_impact_json
+# / attributed_impact_json 并把 job 标记为 done。
+#
+# 关键不变量：
+# 1. Job 未到点 → status="scheduled"，collector 跳过。
+# 2. 事实表无数据 → envelope 保留 metrics={}, completeness=0.0，
+#    禁止用 0 冒充 delta（Phase 4.1 已定的语义）。
+# 3. 一条 job 只允许被成功执行一次；重复调用是 no-op。
+class AgentImpactJobDB(Base):
+    __tablename__ = "agent_impact_jobs"
+
+    id = Column(String(32), primary_key=True)
+    action_id = Column(String(32), ForeignKey("agent_actions.id"), nullable=False, index=True)
+    app_id = Column(Integer, index=True, nullable=False)
+    kind = Column(String(16), nullable=False)   # "observed" | "attributed"
+    window = Column(String(8), nullable=False)  # "2h" | "24h" | "7d"
+
+    scheduled_at = Column(DateTime, nullable=False, index=True)
+    executed_at = Column(DateTime, nullable=True)
+    status = Column(String(16), nullable=False, default="scheduled", index=True)
+    # scheduled / running / done / failed / skipped
+
+    envelope_json = Column(JSON, nullable=True)  # 落成时写入的 envelope 副本
+    error = Column(Text, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("action_id", "kind", "window", name="uq_impact_job_action_kind_window"),
+        Index("ix_impact_jobs_due", "status", "scheduled_at"),
     )

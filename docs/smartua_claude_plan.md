@@ -28,7 +28,7 @@
 | 1 | 真实与模拟严格隔离 | ✅ 已完成 | 1.1 ✅ · 1.2 ✅ |
 | 2 | 对象授权与会话安全 | ✅ 已完成 | 2.1 ✅ · 2.2 ✅ |
 | 3 | 安全动作闭环 | 进行中 | 3.1 ✅ · 3.2 ✅ · 3.3 ✅ |
-| 4 | 真实影响与学习质量 | 待开始 | — |
+| 4 | 真实影响与学习质量 | 进行中 | 4.1 ✅ · 4.2 ✅ |
 | 5 | 持久运行时与多实例协调 | 待开始 | — |
 | 6 | 有限扩充只读能力 | 待开始 | — |
 | 7 | 策略治理与知识库 | 待开始 | — |
@@ -345,7 +345,23 @@
 
 **验收：** 动作刚执行时只有 predicted；没有媒体/MMP 回采时另外两类保持 null，不能用 0 冒充真实结果。
 
-**状态：** ⬜ 待开始 | **依赖：** 3.3 | **下一步：** 模型字段拆分
+**状态：** ✅ 已完成（2026-07-21） | **依赖：** 3.3 | **下一步：** 4.2 延迟回采任务
+
+**验收结果（2026-07-21）：**
+- 新增 `backend/app/services/agent_runtime/impact.py`：`ImpactEnvelope` 数据类 + `make_predicted / make_observed / make_attributed` 三个构造器 + `metric(env, key, default)` 安全取值。envelope 字段：`kind / metrics / window / time_zone / currency / source / freshness / completeness`。缺任何字段一律 None —— 严禁用 0 冒充。
+- `AgentActionDB` 扩两列 `observed_impact_json` / `attributed_impact_json`（都 nullable）；`IntentExecution` 同样扩两列。原有 `predicted_impact_json` 与 `impact_2h/24h/7d_json` 保留，但语义严格为 predicted。
+- Alembic 迁移 `eaa540e8896a_phase4_1_split_impact_into_observed_and_`：只加列（nullable），既有数据零影响，可回滚。真实 `smartua.db` 已 `upgrade head` 到该版本。
+- `tools._compute_impact()`：Phase 4.1 起返回三档 predicted envelope（不再是裸 metrics dict）。source 记为 `simulate_impact/<platform>`，completeness = 1.0，freshness 记为生成时刻。
+- `memory.Episode._metric()`：新格式（envelope 的 `metrics.*`）与老格式（裸 dict）都能读通，保持 Phase 2 记忆层零回归。新增 `Episode.impact_kind(window)` 供 Phase 4.3 学习门禁判断"这是不是可训练样本"。
+- 关键不变量断言：`test_agent_action_defaults_observed_and_attributed_to_null` 明确验证"新增动作只写 predicted，observed / attributed 保持 NULL"；`test_metric_missing_returns_default` 验证 `metric(None, ...)` 返回 default 不冒充 0。
+- 测试：新增 `backend/tests/test_impact_envelope.py` 12 用例。全套 114 项通过（102 → 114）。
+
+**外部依赖阻塞：** 无。observed / attributed 的**生产者**（延迟回采任务、MMP 集成）明确划入 4.2 / 4.3，本步骤只定 schema + provenance envelope + 生产/消费约定。
+
+**遗留风险 / 待办：**
+- 迁移只加列，未修改既有数据。真实数据库里 Phase 3.x 的动作 `predicted_impact_json` 依旧是老裸 dict 格式，Episode `_metric` 会走"裸 dict 分支"读通；如果 Phase 4.2 想统一按 envelope 消费，需要一次一次性回填脚本（不阻塞本 Phase 验收）。
+- Reflector / StrategyStore 目前仍从 `Episode.impact` 里挖 predicted 指标（`avg_delta_roi_7d`），Phase 4.3 学习门禁完成前，策略学习**依然是从 predicted 学 predicted** —— 这是明确的已知问题，等 4.2 观测数据落地才能改为"从 observed 学"。
+- `IntentExecution.impact_2h/24h/7d_json` 保持不变（写 predicted envelope），未拆成对应的 `predicted_*_json`。这些字段在 Phase 3.x 已有大量历史消费者（前端、审计导出），拆列成本远大于本轮收益 —— envelope 里的 `kind` 字段已足够区分。
 
 ---
 
@@ -362,7 +378,30 @@
 
 **验收：** 用固定事实数据和可控时钟运行 collector，三窗口结果可重复且来源明确。
 
-**状态：** ⬜ 待开始 | **依赖：** 4.1、5.2（Job 系统） | **下一步：** 实现 impact collector
+**状态：** ✅ 已完成（2026-07-22） | **依赖：** 4.1 | **下一步：** 4.3 Episode 学习门禁
+
+**验收结果：**
+- 新增 `AgentImpactJobDB`（`agent_impact_jobs` 表，Alembic revision `6aff1c23d194`）：`(action_id, kind, window)` 唯一约束 + `(status, scheduled_at)` 复合索引；kind ∈ {observed, attributed}，window ∈ {2h, 24h, 7d}。
+- 新增 `backend/app/services/agent_runtime/impact_collector.py`：
+  - `enqueue_after_verified(db, action)`：Verified 动作触发 6 条 job（observed × 3 + attributed × 3），scheduled_at = `verified_at + {2h, 24h, 7d}`；无 `entity_id` 直接跳过；同 (action, kind, window) 存在则复用不重复插入。
+  - `run_due_jobs(db, now)`：拾起 `status="scheduled" AND scheduled_at ≤ now` 的 job，用日粒度对齐窗口在 FactMediaDaily / FactMMPDaily 上聚合 pre/post，日均口径计算 delta（避免不同长度窗口误比较）；job 成功后落 `envelope_json` + `status="done"`，异常落 `failed`。
+  - 命中 0 行事实表 → `envelope.metrics={}, completeness=0.0`，**严格遵守 Phase 4.1 "没观察到不能冒充 0 delta" 不变量**。
+  - 时钟通过 `now` 参数注入，测试可任意伪造。
+- `Dispatcher._verify` / `Dispatcher.reconcile` 在 `verified` 转移后调 `_enqueue_impact_jobs`（内部 try/except，enqueue 失败不影响主 dispatcher 流程）。
+- `test_migration.py` head revision 更新为 `6aff1c23d194`，`_KNOWN_TABLES` 由 34 增至 35。
+- 新增 9 项 `test_impact_collector.py` 单元测试：enqueue 语义（6 条 job / 无 entity 跳过 / 幂等）、时序（未到点跳过 / 2h 到点但 7d 未到点）、真实数据回采（observed / attributed 反映 delta，来源标记正确）、空数据不变量（completeness=0，metrics 空）、多次 run 幂等。
+- 全部 123 项 pytest 通过（114 → 123），无回归。
+
+**外部依赖阻塞：**
+- 真实 Google/Meta/TikTok Reports 与 AppsFlyer/Adjust 归因数据未接入 —— collector 逻辑与 fact schema 对齐，但生产验证需要真实事实表回填 pipeline 与凭证；当前只用 Mock 事实表验证收集逻辑。
+- 生产环境需要独立调度器（APScheduler 或 cron）周期性调 `run_due_jobs`，本阶段暂未接入实际调度：Phase 5.2 durable worker 建成后由 worker 消费。
+- Job 状态目前是"单进程同步执行"，多副本运行时存在双跑风险；multi-worker 隔离等到 Phase 5.4 独立调度落地。
+
+**遗留风险 / 未做：**
+- 基线是"简单日均比较"，未做 matched control / DiD / 季节性调整 —— predicted vs observed 的差异可能被噪声主导，Phase 7 反思层再补更严的因果推断。
+- FactMediaDaily / FactMMPDaily 目前查询按 `(app_id, campaign_id)` 精确匹配 —— adset/ad/creative 粒度的动作暂不支持回采，需要 Phase 6 只读能力扩充后再改为按 entity_level 匹配。
+- `completeness` 目前是粗颗粒 (1.0/0.5/0.0)：真实完整性算法（缺日、缺币种、MMP 覆盖率）延到 Phase 4.3 / 6 再细化。
+- Observed / attributed envelope 目前**只覆写 AgentActionDB 字段**，不同步回 `IntentExecution.observed_impact_json` / `attributed_impact_json`；后者由 Phase 4.3 学习门禁触发时按需回填。
 
 ---
 

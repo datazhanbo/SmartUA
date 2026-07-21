@@ -43,10 +43,16 @@ class IntentExecution(Base):
     executed_at = Column(DateTime)
     execution_error = Column(Text)
 
-    # 效果回扫检查点
+    # 效果回扫检查点（历史遗留：预测影响写入 impact_2h/24h/7d_json；仍供 Episode / Memory 消费）
     impact_2h_json = Column(JSON)
     impact_24h_json = Column(JSON)
     impact_7d_json = Column(JSON)
+
+    # Phase 4.1 —— 三类影响严格拆分：
+    # observed_impact_json / attributed_impact_json 只在真实回采 / 归因数据到位后写入；
+    # 若未回采则保持 NULL —— 学习门禁（Phase 4.3）用它区分"可训练样本"与"仅预测样本"。
+    observed_impact_json = Column(JSON)
+    attributed_impact_json = Column(JSON)
 
     # 闭环学习
     model_feedback = Column(String(16))  # good / bad / neutral

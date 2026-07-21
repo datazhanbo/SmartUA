@@ -10,7 +10,9 @@
 
 Episode 字段说明：
 - pre_state：动作前该 campaign 的局部快照（roi/spend/status/country），用于复盘「当时情形」。
-- impact   ：来自 tools._compute_impact 的 impact_2h/24h/7d_json，即动作的反事实因果效应。
+- impact   ：来自 tools._compute_impact 的 impact_2h/24h/7d envelope（Phase 4.1 起严格
+  为 `kind="predicted"`）。**observed / attributed 由回采任务另行落 AgentActionDB / IntentExecution，
+  Episode 只保存"当时的预测"**，避免和真实事实混一起。
 - outcome  ：动作是否成功执行。
 """
 from __future__ import annotations
@@ -63,14 +65,43 @@ class Episode:
     note: str = ""
 
     # --- 便捷取值（供聚合/反思） ---
+    # Phase 4.1 起：impact_24h/7d 都是 predicted envelope（{kind, metrics, window, ...}）；
+    # 兼容旧 Episode（裸 metrics dict）：先尝试 envelope 的 metrics 子键，落回原键。
+    def _metric(self, window: str, key: str) -> float:
+        env = self.impact.get(window) or {}
+        if isinstance(env, dict):
+            m = env.get("metrics")
+            if isinstance(m, dict) and key in m:
+                try:
+                    return float(m.get(key) or 0)
+                except (TypeError, ValueError):
+                    return 0.0
+            # 旧格式：直接是 metrics dict
+            if key in env:
+                try:
+                    return float(env.get(key) or 0)
+                except (TypeError, ValueError):
+                    return 0.0
+        return 0.0
+
     def delta_roi_24h(self) -> float:
-        return float((self.impact.get("impact_24h") or {}).get("delta_roi", 0) or 0)
+        return self._metric("impact_24h", "delta_roi")
 
     def avg_delta_roi_7d(self) -> float:
-        return float((self.impact.get("impact_7d") or {}).get("avg_delta_roi", 0) or 0)
+        return self._metric("impact_7d", "avg_delta_roi")
 
     def delta_spend_24h(self) -> float:
-        return float((self.impact.get("impact_24h") or {}).get("delta_spend", 0) or 0)
+        return self._metric("impact_24h", "delta_spend")
+
+    def impact_kind(self, window: str = "impact_24h") -> Optional[str]:
+        """Phase 4.3 学习门禁用：返回该 window envelope 的 kind
+        （'predicted' / 'observed' / 'attributed' / None）。老 Episode 无 kind 返回 None。"""
+        env = self.impact.get(window)
+        if isinstance(env, dict):
+            k = env.get("kind")
+            if isinstance(k, str):
+                return k
+        return None
 
 
 class EpisodicMemory:
