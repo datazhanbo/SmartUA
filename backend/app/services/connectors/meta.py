@@ -13,7 +13,7 @@ try:
 except ImportError:
     FACEBOOK_SDK_AVAILABLE = False
 
-from .base import BaseConnector
+from .base import BaseConnector, to_usd
 
 logger = logging.getLogger(__name__)
 
@@ -24,22 +24,33 @@ class MetaConnector(BaseConnector):
     platform = "meta"
     source_type = "media"
     rate_limit = 200  # 每小时 200 次请求
+    supported_modes = ("mock", "live")
+    capabilities = {
+        "read": True,
+        "write": True,
+        "structure": True,
+        "simulate": False,
+    }
 
-    def __init__(self, db, app_id, credentials):
-        super().__init__(db, app_id, credentials)
+    def __init__(self, db, app_id, credentials, execution_mode: str = "mock"):
+        super().__init__(db, app_id, credentials, execution_mode=execution_mode)
         self.access_token = credentials.get("access_token")
         self.app_secret = credentials.get("app_secret")
         self.ad_account_id = credentials.get("ad_account_id", "")
+        self.account_id = self.ad_account_id or ""
+        if self.execution_mode == "live":
+            if not FACEBOOK_SDK_AVAILABLE:
+                raise RuntimeError(
+                    "Meta live 模式要求已安装 facebook_business SDK；当前运行环境未安装，"
+                    "不允许静默回退 mock"
+                )
+            if not self.access_token:
+                raise ValueError("Meta live 模式缺少 access_token；不允许静默回退 mock")
 
     def auth(self) -> bool:
         """认证 - 使用 access_token"""
-        if not FACEBOOK_SDK_AVAILABLE:
-            logger.warning("facebook_business SDK not available, using mock mode")
+        if self.execution_mode != "live":
             return True
-
-        if not self.access_token:
-            logger.error("Missing access_token for Meta connector")
-            return False
 
         try:
             FacebookAdsApi.init(access_token=self.access_token)
@@ -54,7 +65,7 @@ class MetaConnector(BaseConnector):
              report_type: str = "campaign_daily",
              **kwargs) -> Dict[str, Any]:
         """拉取数据"""
-        if not FACEBOOK_SDK_AVAILABLE:
+        if self.execution_mode != "live":
             return self._mock_pull(date_from, date_to, report_type, **kwargs)
 
         try:
@@ -196,6 +207,9 @@ class MetaConnector(BaseConnector):
         breakdowns = []
         if report_type in ["creative_daily"]:
             breakdowns.append("dynamic_asset")
+        # 国家维度 breakdown：让真实拉取带 country（与 mock/事实表一致），用于地理报表
+        if report_type in ["campaign_daily", "adset_daily", "ad_daily"]:
+            breakdowns.append("country")
 
         params = {
             "time_range": {
@@ -232,7 +246,7 @@ class MetaConnector(BaseConnector):
                 "impressions": self._safe_int(row.get("impressions", 0)),
                 "clicks": self._safe_int(row.get("clicks", 0)),
                 "spend": self._safe_float(row.get("spend", 0)),
-                "spend_usd": self._safe_float(row.get("spend", 0)),  # Meta 已经是 USD
+                "spend_usd": to_usd(self._safe_float(row.get("spend", 0)), row.get("account_currency", "USD"), self.db, self.app_id),
                 "ctr": self._safe_float(row.get("ctr", 0)),
                 "cpc": self._safe_float(row.get("cpc", 0)),
                 "cpm": self._safe_float(row.get("cpm", 0)),
@@ -264,11 +278,116 @@ class MetaConnector(BaseConnector):
         except (ValueError, TypeError):
             return 0.0
 
+    @staticmethod
+    def _cents(v):
+        """Meta 金额以最小货币单位（分）返回；转为主单位。"""
+        try:
+            return float(v) / 100 if v is not None else None
+        except (ValueError, TypeError):
+            return None
+
+    # === 结构拉取（Campaign->AdSet->Ad->Creative 层级 + 运营态） ===
+
+    def pull_structure(self) -> Dict[str, Any]:
+        """拉取计划分层结构与运营态。"""
+        if self.execution_mode != "live":
+            return self._mock_structure()
+        return self._real_structure()
+
+    def _mock_structure(self) -> Dict[str, Any]:
+        campaigns = [
+            ("120207396134620031", "Campaign_US_2024Q2"),
+            ("120207396134630032", "Campaign_GB_2024Q2"),
+            ("120207396134640033", "Campaign_CA_2024Q2"),
+        ]
+        rows = []
+        acc = self.ad_account_id or "mock_account"
+        for cid, cname in campaigns:
+            rows.append({"entity_level": "campaign", "entity_id": cid, "parent_id": None,
+                         "campaign_id": cid, "campaign_name": cname, "status": "ACTIVE",
+                         "daily_budget": 500.0, "currency": "USD", "account_id": acc})
+            for j in range(1, 3):
+                sid = f"adset_{cid}_{j}"
+                sname = f"Adset_{cname}_{j}"
+                rows.append({"entity_level": "adset", "entity_id": sid, "parent_id": cid,
+                             "campaign_id": cid, "campaign_name": cname, "adset_id": sid,
+                             "adset_name": sname, "status": "ACTIVE", "daily_budget": 250.0,
+                             "bid_amount": 2.0, "currency": "USD", "account_id": acc})
+                for k in range(1, 3):
+                    aid = f"ad_{sid}_{k}"
+                    aname = f"Ad_{sname}_{k}"
+                    rows.append({"entity_level": "ad", "entity_id": aid, "parent_id": sid,
+                                 "campaign_id": cid, "campaign_name": cname, "adset_id": sid,
+                                 "adset_name": sname, "ad_id": aid, "ad_name": aname,
+                                 "status": "ACTIVE", "account_id": acc})
+                    cri = f"cr_{aid}"
+                    rows.append({"entity_level": "creative", "entity_id": cri, "parent_id": aid,
+                                 "campaign_id": cid, "campaign_name": cname, "adset_id": sid,
+                                 "adset_name": sname, "ad_id": aid, "ad_name": aname,
+                                 "creative_id": cri, "creative_name": f"Creative_{aname}",
+                                 "status": "ACTIVE", "account_id": acc})
+        return {"raw_rows": rows, "metadata": {"mode": "mock", "account_id": acc}}
+
+    def _real_structure(self) -> Dict[str, Any]:
+        from facebook_business.adobjects.adaccount import AdAccount
+        from facebook_business.adobjects.campaign import Campaign
+        from facebook_business.adobjects.adset import AdSet
+        from facebook_business.adobjects.ad import Ad
+        from facebook_business.adobjects.adcreative import AdCreative
+
+        aid = self.ad_account_id
+        if not aid:
+            raise ValueError("ad_account_id is required")
+        if not aid.startswith("act_"):
+            aid = f"act_{aid}"
+        account = AdAccount(aid)
+        rows = []
+
+        campaigns = list(account.get_campaigns(
+            fields=["id", "name", "status", "daily_budget", "currency"]))
+        for c in campaigns:
+            cid = c["id"]
+            cur = c.get("currency", "USD")
+            rows.append({"entity_level": "campaign", "entity_id": cid, "parent_id": None,
+                         "campaign_id": cid, "campaign_name": c.get("name", ""),
+                         "status": c.get("status"), "daily_budget": self._cents(c.get("daily_budget")),
+                         "currency": cur, "account_id": aid})
+            adsets = list(Campaign(cid).get_ad_sets(
+                fields=["id", "name", "status", "daily_budget", "bid_amount", "targeting", "currency"]))
+            for s in adsets:
+                sid = s["id"]
+                rows.append({"entity_level": "adset", "entity_id": sid, "parent_id": cid,
+                             "campaign_id": cid, "campaign_name": c.get("name", ""),
+                             "adset_id": sid, "adset_name": s.get("name", ""),
+                             "status": s.get("status"),
+                             "daily_budget": self._cents(s.get("daily_budget")),
+                             "bid_amount": self._cents(s.get("bid_amount")),
+                             "currency": s.get("currency", cur),
+                             "targeting_json": s.get("targeting"), "account_id": aid})
+                ads = list(AdSet(sid).get_ads(fields=["id", "name", "status"]))
+                for a in ads:
+                    aid_ = a["id"]
+                    rows.append({"entity_level": "ad", "entity_id": aid_, "parent_id": sid,
+                                 "campaign_id": cid, "campaign_name": c.get("name", ""),
+                                 "adset_id": sid, "adset_name": s.get("name", ""),
+                                 "ad_id": aid_, "ad_name": a.get("name", ""),
+                                 "status": a.get("status"), "account_id": aid})
+                    creatives = list(Ad(aid_).get_ad_creatives(fields=["id", "name", "status"]))
+                    for cr in creatives:
+                        rows.append({"entity_level": "creative", "entity_id": cr["id"],
+                                     "parent_id": aid_, "campaign_id": cid,
+                                     "campaign_name": c.get("name", ""), "adset_id": sid,
+                                     "adset_name": s.get("name", ""), "ad_id": aid_,
+                                     "ad_name": a.get("name", ""), "creative_id": cr["id"],
+                                     "creative_name": cr.get("name", ""),
+                                     "status": cr.get("status"), "account_id": aid})
+        return {"raw_rows": rows, "metadata": {"mode": "real", "account_id": aid}}
+
     # === Marketing API - 写操作 ===
 
     def update_campaign_budget(self, campaign_id: str, daily_budget: float) -> Dict[str, Any]:
         """更新 Campaign 日预算"""
-        if not FACEBOOK_SDK_AVAILABLE:
+        if self.execution_mode != "live":
             return {"success": True, "campaign_id": campaign_id, "new_budget": daily_budget, "mode": "mock"}
 
         try:
@@ -284,7 +403,7 @@ class MetaConnector(BaseConnector):
 
     def update_campaign_status(self, campaign_id: str, status: str) -> Dict[str, Any]:
         """更新 Campaign 状态（ACTIVE/PAUSED/DELETED）"""
-        if not FACEBOOK_SDK_AVAILABLE:
+        if self.execution_mode != "live":
             return {"success": True, "campaign_id": campaign_id, "new_status": status, "mode": "mock"}
 
         try:
@@ -298,7 +417,7 @@ class MetaConnector(BaseConnector):
 
     def update_adset_bid(self, adset_id: str, bid_amount: float) -> Dict[str, Any]:
         """更新 AdSet 出价"""
-        if not FACEBOOK_SDK_AVAILABLE:
+        if self.execution_mode != "live":
             return {"success": True, "adset_id": adset_id, "new_bid": bid_amount, "mode": "mock"}
 
         try:
@@ -314,7 +433,7 @@ class MetaConnector(BaseConnector):
 
     def rotate_creative(self, campaign_id: str) -> Dict[str, Any]:
         """轮换素材（重新发布一轮创意）"""
-        if not FACEBOOK_SDK_AVAILABLE:
+        if self.execution_mode != "live":
             return {"success": True, "campaign_id": campaign_id, "mode": "mock"}
 
         try:

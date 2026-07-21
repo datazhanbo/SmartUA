@@ -3,8 +3,10 @@
 设计要点：
 - 与"平台做身体+护栏，Agent Loop 做大脑"一致：会话只持有"目标、步骤、待审批项、上下文"，
   真实执行仍走 Connector / 意图引擎（审计、安全分级天然生效）。
-- 当前为**进程内内存仓库**（开发期 + demo 友好，与 MockMediaConnector 的单例引擎同源）。
-  生产环境需落库 + 接 Episodic Memory（见 Phase 2）。
+- Phase A1 起：会话仓库为「进程内缓存（快路径）+ SQLite 持久化（重启不丢）」双轨。
+  - 内存 dict 持有活跃会话对象，loop 对其原地修改立即可见（SSE 实时推流依赖此）。
+  - 每次 create / persist 把会话 + 步骤落库；get 优先命中缓存，未命中则从 DB 重建。
+  - 满足 Phase A1 目标：进程重启后，新建会话 / 步骤 / 状态可从 DB 完整读回。
 """
 from __future__ import annotations
 
@@ -14,6 +16,9 @@ from enum import Enum
 from typing import Dict, Any, List, Optional
 
 from pydantic import BaseModel, Field
+
+from app.db.base import SessionLocal
+from app.models.agent_runtime import AgentSessionDB, AgentStepDB
 
 
 def _now() -> str:
@@ -74,6 +79,10 @@ class AgentSession(BaseModel):
     status: str = "running"   # running / awaiting_approval / done / failed
     steps: List[AgentStep] = Field(default_factory=list)
     context: Dict[str, Any] = Field(default_factory=dict)  # 累计观察（如最近一次 summary）
+    # Phase 1.2：执行 provenance（session-level），前端始终可展示 Mock/Sandbox/Live 标识
+    platform: Optional[str] = None
+    execution_mode: Optional[str] = None
+    account_id: Optional[str] = None
     created_at: str = Field(default_factory=_now)
     updated_at: str = Field(default_factory=_now)
     abort_requested: bool = False            # 用户请求中断当前循环
@@ -99,24 +108,160 @@ class AgentSession(BaseModel):
 
 
 class AgentSessionStore:
-    """进程内会话仓库（单例）。开发期足够；生产需替换为 DB-backed。"""
+    """会话仓库：进程内缓存（快路径）+ SQLite 持久化（重启不丢，Phase A1）。
+
+    - 内存 dict 持有活跃会话对象，loop 对其原地修改立即可见（SSE 实时推流依赖此）。
+    - 每次 create / persist 把会话 + 步骤落库；get 优先命中缓存，未命中则从 DB 重建。
+    """
 
     def __init__(self):
-        self._sessions: Dict[str, AgentSession] = {}
+        self._cache: Dict[str, AgentSession] = {}
 
-    def create(self, app_id: int, user_id: int, goal: str) -> AgentSession:
-        s = AgentSession(app_id=app_id, user_id=user_id, goal=goal)
-        self._sessions[s.id] = s
+    # ----- 持久化辅助 -----
+    _PROV_KEY = "_provenance"
+
+    @classmethod
+    def _row_to_session(cls,
+                        row: AgentSessionDB,
+                        steps: Optional[List[AgentStepDB]]) -> AgentSession:
+        step_objs: List[AgentStep] = []
+        for sr in (steps or []):
+            step_objs.append(AgentStep(
+                id=sr.id,
+                kind=sr.kind,
+                text=sr.text,
+                tool=sr.tool,
+                params=sr.params_json or {},
+                risk_level=sr.risk_level,
+                predicted_impact=sr.predicted_impact_json,
+                status=sr.status or "done",
+                result=sr.result_json,
+                created_at=sr.created_at.isoformat() if sr.created_at else _now(),
+            ))
+        raw_ctx = dict(row.context_json or {})
+        prov = raw_ctx.pop(cls._PROV_KEY, None) or {}
+        return AgentSession(
+            id=row.id,
+            app_id=row.app_id,
+            user_id=row.user_id,
+            goal=row.goal or "",
+            status=row.status or "running",
+            steps=step_objs,
+            context=raw_ctx,
+            platform=prov.get("platform"),
+            execution_mode=prov.get("execution_mode"),
+            account_id=prov.get("account_id"),
+            created_at=row.created_at.isoformat() if row.created_at else _now(),
+            updated_at=row.updated_at.isoformat() if row.updated_at else _now(),
+            abort_requested=bool(row.abort_requested),
+            pending_redirect=row.pending_redirect,
+        )
+
+    def persist(self, session: AgentSession) -> None:
+        """把会话对象（含全部步骤）写入 SQLite（upsert 会话 + 重建步骤）。"""
+        db = SessionLocal()
+        try:
+            row = db.get(AgentSessionDB, session.id)
+            if row is None:
+                row = AgentSessionDB(id=session.id)
+                db.add(row)
+            row.app_id = session.app_id
+            row.user_id = session.user_id
+            row.goal = session.goal
+            row.status = session.status
+            ctx_to_save = dict(session.context or {})
+            ctx_to_save[self._PROV_KEY] = {
+                "platform": session.platform,
+                "execution_mode": session.execution_mode,
+                "account_id": session.account_id,
+            }
+            row.context_json = ctx_to_save
+            row.abort_requested = session.abort_requested
+            row.pending_redirect = session.pending_redirect
+            row.updated_at = datetime.utcnow()
+            # 重建步骤（先删后插，保证顺序与当前内存一致）
+            db.query(AgentStepDB).filter(AgentStepDB.session_id == session.id).delete()
+            for seq, st in enumerate(session.steps, start=1):
+                db.add(AgentStepDB(
+                    id=st.id,
+                    session_id=session.id,
+                    seq=seq,
+                    kind=st.kind,
+                    text=st.text,
+                    tool=st.tool,
+                    params_json=st.params,
+                    risk_level=st.risk_level,
+                    predicted_impact_json=st.predicted_impact,
+                    status=st.status,
+                    result_json=st.result,
+                ))
+            db.commit()
+        finally:
+            db.close()
+        self._cache[session.id] = session
+
+    def create(self, app_id: int, user_id: int, goal: str,
+               platform: Optional[str] = None,
+               execution_mode: Optional[str] = None,
+               account_id: Optional[str] = None) -> AgentSession:
+        s = AgentSession(
+            app_id=app_id, user_id=user_id, goal=goal,
+            platform=platform, execution_mode=execution_mode, account_id=account_id,
+        )
+        self._cache[s.id] = s
+        self.persist(s)
         return s
 
     def get(self, session_id: str) -> Optional[AgentSession]:
-        return self._sessions.get(session_id)
+        if session_id in self._cache:
+            return self._cache[session_id]
+        db = SessionLocal()
+        try:
+            row = db.get(AgentSessionDB, session_id)
+            if row is None:
+                return None
+            steps = db.query(AgentStepDB).filter(
+                AgentStepDB.session_id == session_id).order_by(AgentStepDB.seq).all()
+            s = self._row_to_session(row, steps)
+        finally:
+            db.close()
+        self._cache[session_id] = s
+        return s
 
     def list(self, app_id: int) -> List[AgentSession]:
-        return [s for s in self._sessions.values() if s.app_id == app_id]
+        db = SessionLocal()
+        try:
+            rows = db.query(AgentSessionDB).filter(
+                AgentSessionDB.app_id == app_id).order_by(
+                AgentSessionDB.created_at.desc()).all()
+        finally:
+            db.close()
+        return [self.get(r.id) for r in rows]
 
     def delete(self, session_id: str) -> bool:
-        return self._sessions.pop(session_id, None) is not None
+        self._cache.pop(session_id, None)
+        db = SessionLocal()
+        try:
+            row = db.get(AgentSessionDB, session_id)
+            if row is None:
+                return False
+            db.query(AgentStepDB).filter(AgentStepDB.session_id == session_id).delete()
+            db.delete(row)
+            db.commit()
+            return True
+        finally:
+            db.close()
+
+    def clear(self) -> None:
+        """清空全部会话（演示 / 测试用）。"""
+        self._cache.clear()
+        db = SessionLocal()
+        try:
+            db.query(AgentStepDB).delete()
+            db.query(AgentSessionDB).delete()
+            db.commit()
+        finally:
+            db.close()
 
 
 # 全局单例（与 MockMediaConnector 的引擎单例机制一致）

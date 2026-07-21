@@ -6,23 +6,28 @@
 3. 去重：冷却期内同异常不重复告警
 4. 数据驱动：ROI 跌破阈值优先采用 Phase 3 已学策略（演示"处置质量高于上线初期"）
 """
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from app.services.connectors.mock_media import reset_sim_engine
 from app.services.agent_runtime import (
     get_memory, get_strategy, get_session_store, get_autonomy_store,
 )
 from app.services.agent_runtime.autonomy import AutonomyEngine, AnomalyDetector
 from app.services.connectors import ConnectorFactory
+from app.db.base import Base, engine
 from app.config import settings
 
 
 def _reset_state():
-    """清空所有进程内单例，保证演示可复现。"""
+    """清空所有单例（含持久化层），保证演示可复现。"""
     reset_sim_engine(seed=42)                      # 重置模拟引擎（含 3 天预置历史）
-    get_memory()._eps = []                          # 清空记忆
+    get_memory().clear()                            # 清空记忆（含 agent_episodes 表）
     get_strategy().reset()                          # 清空策略
-    get_session_store()._sessions = {}              # 清空会话仓
-    st = get_autonomy_store()
-    st._alerts = []; st._scans = []; st._handlers = {}; st._scan_seq = 0
+    get_session_store().clear()                     # 清空会话仓（含 agent_sessions/steps 表）
+    get_autonomy_store().clear()                    # 清空告警/扫描（含 agent_autonomy_* 表）
 
 
 def _print_summary(title):
@@ -33,6 +38,9 @@ def _print_summary(title):
 
 
 def main():
+    # 确保 Phase A1 新增的持久化表存在（首次运行 / 未启动过服务时）
+    Base.metadata.create_all(bind=engine)
+    settings.agent_default_platform = "mock"  # 演示使用模拟引擎，避免 Google 连接器无数据
     _reset_state()
     print("=" * 70)
     print("Phase 4 主动式自治 演示")
@@ -92,8 +100,11 @@ def main():
     # 重新加载策略单例
     get_strategy()._rules = s._rules
     get_sim_engine().set_account_status("ok")  # 恢复账户，避免干扰
+    from app.services.connectors import resolve_credentials
     connector2 = ConnectorFactory.get_connector(
-        settings.agent_default_platform, db=None, app_id=1, credentials={})
+        settings.agent_default_platform, db=None, app_id=1,
+        credentials=resolve_credentials(settings.agent_default_platform, db=None, app_id=1),
+        execution_mode=settings.agent_execution_mode)
     det = AnomalyDetector(strategy=get_strategy())
     new_anoms = det.detect(connector2, 1)
     roi_anoms = [x for x in new_anoms if x.type == "roi_drop"]

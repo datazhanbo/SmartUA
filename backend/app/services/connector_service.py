@@ -4,6 +4,7 @@ import logging
 from sqlalchemy.orm import Session
 
 from .connectors import ConnectorFactory
+from app.config import settings
 from app.models.data import ConnectorRun, ConnectorCredential, RawPayload, FactMediaDaily, FactMMPDaily, AggUADaily
 from app.schemas.data import ConnectorCredentialCreate, ConnectorCredentialUpdate
 
@@ -79,7 +80,8 @@ class ConnectorService:
             platform=platform,
             db=self.db,
             app_id=app_id,
-            credentials=credentials
+            credentials=credentials,
+            execution_mode=settings.agent_execution_mode,
         )
 
         result = connector.execute_pull(
@@ -115,7 +117,8 @@ class ConnectorService:
             platform=platform,
             db=self.db,
             app_id=app_id,
-            credentials=credentials
+            credentials=credentials,
+            execution_mode=settings.agent_execution_mode,
         )
 
         if not connector.auth():
@@ -437,7 +440,8 @@ class ConnectorService:
                 platform=credential.platform,
                 db=self.db,
                 app_id=app_id,
-                credentials=credential.credentials_json
+                credentials=credential.credentials_json,
+                execution_mode=settings.agent_execution_mode,
             )
 
             is_valid = connector.auth()
@@ -458,7 +462,7 @@ class ConnectorService:
             return {"success": False, "error": str(e)}
 
     def _get_default_credentials(self, app_id: int, platform: str) -> Optional[Dict]:
-        """获取默认凭证（从数据库读取）"""
+        """获取默认凭证：库表优先；platform=google 且无库表凭证时回退 config google_* 字段。"""
         credential = self.db.query(ConnectorCredential).filter(
             ConnectorCredential.app_id == app_id,
             ConnectorCredential.platform == platform,
@@ -466,4 +470,11 @@ class ConnectorService:
             ConnectorCredential.is_verified == True
         ).order_by(ConnectorCredential.updated_at.desc()).first()
 
-        return credential.credentials_json if credential else None
+        if credential:
+            return credential.credentials_json
+        # google 平台：库表无凭证时回退 .env/config 中的 google_* 字段（填充即真实链路）
+        if platform == "google":
+            from app.config import settings
+            creds = settings.google_credentials_dict
+            return creds or None
+        return None

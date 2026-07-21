@@ -42,10 +42,18 @@ class MockMediaConnector(BaseConnector):
     platform = "mock"
     source_type = "media"
     rate_limit = 1000  # mock 不限流
+    supported_modes = ("mock",)
+    capabilities = {
+        "read": True,
+        "write": True,
+        "structure": True,
+        "simulate": True,
+    }
 
-    def __init__(self, db, app_id, credentials):
-        super().__init__(db, app_id, credentials)
+    def __init__(self, db, app_id, credentials, execution_mode: str = "mock"):
+        super().__init__(db, app_id, credentials, execution_mode=execution_mode)
         self.engine = get_sim_engine(credentials.get("seed", 42))
+        self.account_id = "mock-sim-account"
 
     # ---------------- 认证 ---------------- #
     def auth(self) -> bool:

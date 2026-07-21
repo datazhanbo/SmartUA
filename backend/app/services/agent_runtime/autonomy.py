@@ -25,6 +25,8 @@ from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from app.config import settings
+from app.db.base import SessionLocal
+from app.models.agent_runtime import AutonomyAlertDB, AutonomyScanDB
 from app.services.agent_runtime.session import (
     AgentSession, AgentStep, AgentStepKind, AgentStepStatus, get_session_store,
 )
@@ -36,6 +38,25 @@ logger = logging.getLogger(__name__)
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_dt(v):
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        return v
+    try:
+        return datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+    except Exception:
+        return datetime.utcnow()
+
+
+def _fmt_dt(v):
+    if v is None:
+        return None
+    if isinstance(v, str):
+        return v
+    return v.isoformat()
 
 
 # 系统发起会话使用的占位 user（前端审批走真实 /agent/sessions/{id}/approve，不校验归属）
@@ -129,7 +150,7 @@ class AnomalyDetector:
         if learned:
             threshold = self.strategy.advise("pause_roi_threshold", 1.0)
         for s in active:
-            if s["roi"] < threshold:
+            if s.get("roi") is not None and s["roi"] < threshold:
                 anomalies.append(Anomaly(
                     app_id=app_id, campaign_id=s["campaign_id"], type=AnomalyType.ROI_DROP,
                     title=f"{s['campaign_id']} ROI={s['roi']:.2f} 跌破 {threshold:.2f}",
@@ -144,7 +165,7 @@ class AnomalyDetector:
         # 3) 素材疲劳：creative_age 偏高且 ROI 仍健康（否则走 ROI_DROP）
         fatigue_age = int(getattr(settings, "agent_fatigue_threshold_days", 8))
         for s in active:
-            if s["roi"] < threshold:
+            if s.get("roi") is not None and s["roi"] < threshold:
                 continue
             age = int(s.get("creative_age", 0) or 0)
             if age >= fatigue_age:
@@ -167,7 +188,8 @@ class AnomalyDetector:
                 age = int(s.get("creative_age", 0) or 0)
                 if age >= fatigue_age:
                     continue  # 由 CREATIVE_FATIGUE 处理（L0 自动轮换更对症）
-                if s["cpi"] > 0 and s["cpi"] >= max(med * 1.8, 12.0) and s["roi"] >= threshold:
+                if s["cpi"] > 0 and s["cpi"] >= max(med * 1.8, 12.0) \
+                        and s.get("roi") is not None and s["roi"] >= threshold:
                     anomalies.append(Anomaly(
                         app_id=app_id, campaign_id=s["campaign_id"], type=AnomalyType.CPI_SPIKE,
                         title=f"{s['campaign_id']} CPI={s['cpi']:.2f} 飙升",
@@ -208,11 +230,13 @@ class AutonomyEngine:
 
     def scan(self, app_id: int = 1, db=None, user=None) -> List[AutonomyAlert]:
         """执行一次主动巡检：检测异常并按风险分级处置。可在调度器或手动端点调用。"""
-        from app.services.connectors import ConnectorFactory
+        from app.services.connectors import ConnectorFactory, resolve_credentials
         from app.services.agent_runtime import get_memory, get_strategy
 
         connector = ConnectorFactory.get_connector(
-            settings.agent_default_platform, db=db, app_id=app_id, credentials={})
+            settings.agent_default_platform, db=db, app_id=app_id,
+            credentials=resolve_credentials(settings.agent_default_platform, db=db, app_id=app_id),
+            execution_mode=settings.agent_execution_mode)
         ctx = AgentContext(db=db, user=user, app_id=app_id, session=None,
                            connector=connector, memory=get_memory(), strategy=get_strategy())
 
@@ -254,7 +278,7 @@ class AutonomyEngine:
             session.status = "done"
             alert.status = "no_action"
             alert.resolution = "仅通知优化师，未自动处置"
-            self.store._alerts.append(alert)
+            self.store.add_alert(alert)
             return alert
 
         registry = get_tool_registry()
@@ -288,9 +312,7 @@ class AutonomyEngine:
             alert.step_id = step.id
             alert.resolution = "等待优化师审批"
 
-        self.store._alerts.append(alert)
-        if len(self.store._alerts) > 200:
-            self.store._alerts = self.store._alerts[-200:]
+        self.store.add_alert(alert)
         return alert
 
 
@@ -298,14 +320,58 @@ class AutonomyEngine:
 # 存储（进程内单例）：扫描历史 + 告警流 + 调度配置
 # --------------------------------------------------------------------------- #
 class AutonomyStore:
+    """扫描历史 + 告警流 + 调度配置：进程内缓存（快路径）+ SQLite 持久化（重启不丢，Phase A1）。
+
+    - `_alerts` / `_scans` 为内存缓存，首次访问从 DB 载入；`add_alert` / `record_scan` 写库。
+    - `_handlers` / `_scan_seq` 为进程内去重状态（重启后重置，去重退化为"本进程内"语义，可接受）。
+    """
+
     def __init__(self):
         self._alerts: List[AutonomyAlert] = []
         self._scans: List[Dict[str, Any]] = []
-        self._scan_seq: int = 0
         self._handlers: Dict[Any, int] = {}   # (type, campaign_id) -> 最近处理时的 scan_seq
+        self._scan_seq: int = 0
+        self._loaded = False
         self.enabled = bool(getattr(settings, "agent_autonomy_enabled", False))
         self.interval_seconds = int(getattr(settings, "agent_autonomy_interval_seconds", 120))
         self.last_scan_at: Optional[str] = None
+
+    # ----- DB 加载 -----
+    def _ensure_loaded(self):
+        if self._loaded:
+            return
+        db = SessionLocal()
+        try:
+            scan_rows = db.query(AutonomyScanDB).order_by(AutonomyScanDB.id).all()
+            self._scans = [{
+                "at": _fmt_dt(r.at), "app_id": r.app_id,
+                "n_anomalies": r.n_anomalies, "n_alerts": r.n_alerts,
+            } for r in scan_rows]
+            alert_rows = db.query(AutonomyAlertDB).order_by(AutonomyAlertDB.detected_at).all()
+            self._alerts = [self._row_to_alert(r) for r in alert_rows]
+        finally:
+            db.close()
+        self._loaded = True
+        if self._scans:
+            self.last_scan_at = self._scans[-1]["at"]
+
+    @staticmethod
+    def _row_to_alert(row: AutonomyAlertDB) -> AutonomyAlert:
+        anomaly_dict = row.anomaly_json or {}
+        anomaly = Anomaly(**{k: anomaly_dict.get(k) for k in (
+            "id", "detected_at", "app_id", "campaign_id", "type", "title",
+            "severity", "detail", "metrics", "suggested_tool",
+            "suggested_params", "suggested_risk", "rationale")})
+        return AutonomyAlert(
+            id=row.id,
+            detected_at=_fmt_dt(row.detected_at) or _now(),
+            app_id=row.app_id,
+            anomaly=anomaly,
+            status=row.status,
+            session_id=row.session_id,
+            step_id=row.step_id,
+            resolution=row.resolution or "",
+        )
 
     # 调度配置
     def set_enabled(self, v: bool):
@@ -316,10 +382,12 @@ class AutonomyStore:
 
     # 扫描序号 + 冷却去重
     def next_seq(self) -> int:
+        self._ensure_loaded()
         self._scan_seq += 1
         return self._scan_seq
 
     def should_skip(self, a: Anomaly, seq: int) -> bool:
+        self._ensure_loaded()
         last = self._handlers.get((a.type, a.campaign_id))
         if last is None:
             return False
@@ -329,7 +397,45 @@ class AutonomyStore:
     def mark_handled(self, a: Anomaly, seq: int):
         self._handlers[(a.type, a.campaign_id)] = seq
 
-    # 记录 + 查询
+    # ----- 记录 -----
+    def add_alert(self, alert: AutonomyAlert) -> None:
+        """追加一条告警并落库（供 `AutonomyEngine._remediate` 调用，替代直接 `_alerts.append`）。"""
+        self._ensure_loaded()
+        self._alerts.append(alert)
+        db = SessionLocal()
+        try:
+            db.add(AutonomyAlertDB(
+                id=alert.id,
+                detected_at=_parse_dt(alert.detected_at),
+                app_id=alert.app_id,
+                anomaly_json=alert.anomaly.to_dict(),
+                status=alert.status,
+                session_id=alert.session_id,
+                step_id=alert.step_id,
+                resolution=alert.resolution or "",
+            ))
+            db.commit()
+        finally:
+            db.close()
+
+    def _persist_alert(self, alert: AutonomyAlert) -> None:
+        """回写已存在告警的状态 / 处置结论（审批端点调用）。"""
+        db = SessionLocal()
+        try:
+            row = db.get(AutonomyAlertDB, alert.id)
+            if row is None:
+                db.add(AutonomyAlertDB(
+                    id=alert.id, detected_at=_parse_dt(alert.detected_at),
+                    app_id=alert.app_id, anomaly_json=alert.anomaly.to_dict(),
+                    status=alert.status, session_id=alert.session_id,
+                    step_id=alert.step_id, resolution=alert.resolution or ""))
+            else:
+                row.status = alert.status
+                row.resolution = alert.resolution or ""
+            db.commit()
+        finally:
+            db.close()
+
     def record_scan(self, app_id: int, anomalies: List[Dict], alerts: List[Dict]):
         self.last_scan_at = _now()
         self._scans.append({
@@ -338,17 +444,44 @@ class AutonomyStore:
         })
         if len(self._scans) > 100:
             self._scans = self._scans[-100:]
+        db = SessionLocal()
+        try:
+            db.add(AutonomyScanDB(
+                at=_parse_dt(self.last_scan_at), app_id=app_id,
+                n_anomalies=len(anomalies), n_alerts=len(alerts)))
+            db.commit()
+        finally:
+            db.close()
 
     def list_alerts(self, app_id: Optional[int] = None) -> List[AutonomyAlert]:
+        self._ensure_loaded()
         if app_id is None:
             return list(self._alerts)
         return [a for a in self._alerts if a.app_id == app_id]
 
     def get_alert(self, alert_id: str) -> Optional[AutonomyAlert]:
+        self._ensure_loaded()
         return next((a for a in self._alerts if a.id == alert_id), None)
 
     def pending_count(self) -> int:
+        self._ensure_loaded()
         return sum(1 for a in self._alerts if a.status == "pending_approval")
+
+    def clear(self) -> None:
+        """清空全部告警与扫描记录（演示 / 测试用）。"""
+        db = SessionLocal()
+        try:
+            db.query(AutonomyAlertDB).delete()
+            db.query(AutonomyScanDB).delete()
+            db.commit()
+        finally:
+            db.close()
+        self._alerts = []
+        self._scans = []
+        self._handlers = {}
+        self._scan_seq = 0
+        self.last_scan_at = None
+        self._loaded = True
 
 
 # --------------------------------------------------------------------------- #
@@ -395,12 +528,14 @@ def stop_scheduler():
 
 
 def update_alert_for_session(session_id: str, approved: bool, resolution: str):
-    """审批端点回写：把关联到该会话的待审批告警标记为已批准/已驳回。"""
+    """审批端点回写：把关联到该会话的待审批告警标记为已批准/已驳回，并落库。"""
     store = get_autonomy_store()
+    store._ensure_loaded()
     for al in store._alerts:
         if al.session_id == session_id and al.status == "pending_approval":
             al.status = "approved" if approved else "rejected"
             al.resolution = resolution
+            store._persist_alert(al)
             return al
     return None
 

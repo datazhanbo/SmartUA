@@ -331,3 +331,73 @@ class DashboardCache(Base):
     data_json = Column(JSON, nullable=False)
     refreshed_at = Column(DateTime, default=datetime.utcnow)
     expires_at = Column(DateTime)
+
+
+class DimCampaignStructure(Base):
+    """计划分层/运营态维度表（DIM，current snapshot）。
+
+    解决原 current_summary() 把 status / daily_budget / creative_age 硬编码为
+    ACTIVE / None 的问题：媒体连接器 pull_structure() 拉取 Campaign-&gt;AdSet-&gt;Ad-&gt;Creative
+    层级与运营态（status / 预算 / 出价 / 定向），upsert 进本表。current_summary() 改读
+    本表得到真实运营态。
+
+    设计取舍：单 current row（按 app_id+platform+entity_level+entity_id upsert），
+    version/as_of_date 记录最近一次刷新；完整历史可从 raw_payloads 回溯。SCD Type-2
+    历史（effective_from/to）为后续增强项，当前不实现以避免写放大与触发复杂度。
+    """
+
+    __tablename__ = "dim_campaign_structure"
+
+    id = Column(Integer, primary_key=True, autoincrement=True, index=True)
+    app_id = Column(Integer, ForeignKey("apps.id"), nullable=False, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    source_platform = Column(String(32), nullable=False, index=True)  # meta/google/tiktok
+    account_id = Column(String(64), index=True)
+
+    entity_level = Column(String(16), nullable=False, index=True)  # campaign/adset/ad/creative
+    entity_id = Column(String(128), nullable=False, index=True)     # 该层级自身 ID
+    parent_id = Column(String(128), index=True)                     # campaign_id（逐层上溯）
+
+    campaign_id = Column(String(128), index=True)
+    campaign_name = Column(String(512))
+    adset_id = Column(String(128), index=True)
+    adset_name = Column(String(512))
+    ad_id = Column(String(128), index=True)
+    ad_name = Column(String(512))
+    creative_id = Column(String(128), index=True)
+    creative_name = Column(String(512))
+
+    status = Column(String(32))
+    daily_budget = Column(Numeric(18, 4))
+    bid_amount = Column(Numeric(18, 4))
+    currency = Column(String(8), default="USD")
+    targeting_json = Column(JSON)
+
+    as_of_date = Column(Date, index=True)       # 最近一次刷新日
+    first_seen_date = Column(Date)              # 首次出现日（用于 creative/age 计算）
+    version = Column(Integer, default=1)
+
+    __table_args__ = (
+        Index("idx_struct_upsert", "app_id", "source_platform", "entity_level", "entity_id", unique=True),
+    )
+
+
+class DimFxRate(Base):
+    """币种汇率维度表（DIM）：1 quote_currency = rate USD。
+
+    spend_usd 由连接器 normalize() 经 to_usd() 计算：优先查本表最新汇率，
+    缺失则回退静态 FX 表（base.py _FX_STATIC），再缺失则视为 1.0 并告警。
+    """
+
+    __tablename__ = "dim_fx_rate"
+
+    id = Column(Integer, primary_key=True, autoincrement=True, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    base_currency = Column(String(8), default="USD", nullable=False)
+    quote_currency = Column(String(8), nullable=False, index=True)
+    rate = Column(Numeric(18, 8), nullable=False)
+    as_of_date = Column(Date, index=True)
+    source = Column(String(32), default="static")

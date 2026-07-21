@@ -55,12 +55,36 @@ class MessageRequest(BaseModel):
 
 # ----------------------------- 依赖 ----------------------------- #
 def _make_ctx(db: Session, user: User, app_id: int) -> AgentContext:
-    from app.services.connectors import ConnectorFactory
+    from app.services.connectors import ConnectorFactory, resolve_credentials
     connector = ConnectorFactory.get_connector(
-        settings.agent_default_platform, db=db, app_id=app_id, credentials={})
+        settings.agent_default_platform, db=db, app_id=app_id,
+        credentials=resolve_credentials(settings.agent_default_platform, db=db, app_id=app_id),
+        execution_mode=settings.agent_execution_mode)
     return AgentContext(db=db, user=user, app_id=app_id, session=None,
                         connector=connector, memory=get_memory(),
                         strategy=get_strategy())
+
+
+def _resolve_session_provenance(db: Session, app_id: int) -> dict:
+    """新建会话前解析真实执行目标：平台 / 执行模式 / 账户。
+
+    Phase 1.2：会话一诞生即冻结 provenance，前端从 snapshot 起就能显示
+    Mock/Sandbox/Live 标识，也能在审批卡上看到"这条动作作用在哪个账户"。
+    绝不静默切换：若连接器构造失败（缺凭证 / SDK 未装），此函数不吞异常，
+    让 create_session 拒绝创建。
+    """
+    from app.services.connectors import ConnectorFactory, resolve_credentials
+    platform = settings.agent_default_platform
+    execution_mode = settings.agent_execution_mode
+    connector = ConnectorFactory.get_connector(
+        platform, db=db, app_id=app_id,
+        credentials=resolve_credentials(platform, db=db, app_id=app_id),
+        execution_mode=execution_mode)
+    return {
+        "platform": connector.platform,
+        "execution_mode": connector.execution_mode,
+        "account_id": connector.account_id or "",
+    }
 
 
 # ----------------------------- 后台异步执行 Agent Loop ----------------------------- #
@@ -95,6 +119,10 @@ def _spawn_loop(method: str, session, user, app_id: int, **kw):
                     kind=AgentStepKind.FINAL.value,
                     text=f"Agent 执行异常：{e}",
                     status=AgentStepStatus.FAILED.value))
+            except Exception:
+                pass
+            try:
+                get_session_store().persist(session)
             except Exception:
                 pass
         finally:
@@ -133,7 +161,16 @@ def create_session(
 ):
     """创建 Agent 会话并异步启动 ReAct 循环（立即返回，进度由前端轮询）。"""
     store = get_session_store()
-    session = store.create(app_id=req.app_id, user_id=current_user.id, goal=req.text)
+    try:
+        prov = _resolve_session_provenance(db, req.app_id)
+    except (ValueError, RuntimeError) as e:
+        # Phase 1.1 fail-closed 语义：live 缺凭证 / SDK 直接拒绝创建会话
+        raise HTTPException(status_code=400, detail=f"无法初始化执行目标: {e}")
+    session = store.create(
+        app_id=req.app_id, user_id=current_user.id, goal=req.text,
+        platform=prov["platform"], execution_mode=prov["execution_mode"],
+        account_id=prov["account_id"],
+    )
     _spawn_loop("start", session, current_user, req.app_id)
     return session
 
@@ -186,14 +223,20 @@ async def stream_session(
         last_status = session.status
         # 跟踪每个 step 的文本长度 + 状态，用于检测"思考步骤内容增长"并重发
         step_sig: Dict[str, tuple] = {}
+        provenance = {
+            "platform": session.platform,
+            "execution_mode": session.execution_mode,
+            "account_id": session.account_id,
+        }
         # 初始快照：让前端立即拿到已有步骤与状态
         yield _sse("snapshot", {
             "steps": [s.model_dump() for s in session.steps],
             "status": session.status,
+            "provenance": provenance,
         })
         for st in session.steps:
             step_sig[st.id] = (len(st.text), st.status)
-        yield _sse("status", {"status": session.status})
+        yield _sse("status", {"status": session.status, "provenance": provenance})
         heartbeat = 0
         max_iter = int(30 * 60 / 0.3)  # 安全上限：约 30 分钟，防连接泄漏
         while heartbeat < max_iter:
@@ -292,6 +335,7 @@ def abort_session(
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     session.abort_requested = True
+    store.persist(session)
     return {"ok": True, "status": session.status}
 
 
@@ -315,6 +359,7 @@ def redirect_session(
         raise HTTPException(status_code=400, detail="仅运行中的会话可改向")
     session.abort_requested = True
     session.pending_redirect = req.text
+    store.persist(session)
     return {"ok": True, "status": session.status, "pending_redirect": req.text}
 
 
@@ -403,6 +448,7 @@ def autonomy_status(
         "alerts_total": len(store.list_alerts()),
         "pending": store.pending_count(),
         "platform": settings.agent_default_platform,
+        "execution_mode": settings.agent_execution_mode,
         "monitor_app_ids": settings.agent_monitor_app_ids,
     }
 

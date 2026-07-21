@@ -51,6 +51,31 @@ const ALERT_STATUS = {
   rejected: { color: 'red', label: '已驳回' },
 }
 
+// ----------------------------- Provenance 标签 ----------------------------- //
+// Phase 1.2：会话 / 步骤 / 告警在任何时候都要能告诉用户"这条动作作用在 Mock / Sandbox / Live 的哪个账户"。
+const EXEC_MODE_META = {
+  mock:    { color: 'default',   label: 'MOCK',    tip: '模拟数据，不影响真实账户' },
+  sandbox: { color: 'geekblue',  label: 'SANDBOX', tip: '沙箱环境，不影响真实预算' },
+  live:    { color: 'red',       label: 'LIVE',    tip: '真实账户，动作将扣真实预算' },
+}
+
+function ProvenanceTag({ platform, execution_mode, account_id, size = 'default' }) {
+  if (!platform && !execution_mode && !account_id) return null
+  const meta = EXEC_MODE_META[execution_mode] || { color: 'default', label: (execution_mode || 'UNKNOWN').toUpperCase(), tip: '' }
+  const parts = []
+  if (platform) parts.push(platform)
+  if (account_id) parts.push(account_id)
+  const label = parts.join(' · ')
+  return (
+    <Tooltip title={meta.tip || ''}>
+      <Space size={4} style={{ fontSize: size === 'small' ? 11 : 12 }}>
+        <Tag color={meta.color} style={{ marginInlineEnd: 0 }}>{meta.label}</Tag>
+        {label && <Tag>{label}</Tag>}
+      </Space>
+    </Tooltip>
+  )
+}
+
 // ----------------------------- 影响可视化 ----------------------------- //
 function ImpactView({ impact }) {
   if (!impact) return null
@@ -85,6 +110,7 @@ function StepView({ step, loading, onApprove }) {
 
   if (step.kind === 'approval') {
     const pending = step.status === 'proposed'
+    const prov = step.result?.provenance
     return (
       <Card size="small" style={{ borderLeft: '4px solid #faad14', background: '#fffbe6', marginBottom: 12 }}>
         <Space direction="vertical" style={{ width: '100%' }} size={6}>
@@ -92,6 +118,9 @@ function StepView({ step, loading, onApprove }) {
             <Tag color="orange" icon={<SafetyOutlined />}>⏳ 待审批 {step.risk_level || ''}</Tag>
             <Text strong>{step.text}</Text>
           </Space>
+          {prov && (
+            <ProvenanceTag platform={prov.platform} execution_mode={prov.execution_mode} account_id={prov.account_id} />
+          )}
           {pending ? (
             <Space>
               <Button type="primary" size="small" loading={loading}
@@ -147,6 +176,14 @@ function StepView({ step, loading, onApprove }) {
             <Tag color="green">{meta.emoji} 已执行</Tag>
             {step.tool && <Tag>{step.tool}</Tag>}
             {step.risk_level && <Tag color="blue">{step.risk_level}</Tag>}
+            {step.result?.execution_mode && (
+              <ProvenanceTag
+                platform={step.result?.platform}
+                execution_mode={step.result?.execution_mode}
+                account_id={step.result?.account_id}
+                size="small"
+              />
+            )}
           </Space>
           <div>{step.text}</div>
           <ImpactView impact={step.result?.impact} />
@@ -218,6 +255,12 @@ function AutonomyPanel({ status, alerts, loading, onScan, onToggle, onApprove, o
           最近扫描：{status?.last_scan_at || '（暂无）'} · 待审批：
           <Text strong style={{ color: '#fa8c16' }}> {status?.pending ?? 0} </Text>条
           {' '}· 平台：{status?.platform}
+          {status?.execution_mode && (
+            <>
+              {' '}·{' '}
+              <ProvenanceTag platform={status.platform} execution_mode={status.execution_mode} size="small" />
+            </>
+          )}
         </div>
       </Card>
 
@@ -327,7 +370,14 @@ function AgentConsole() {
     es.addEventListener('snapshot', (e) => {
       try {
         const d = JSON.parse(e.data)
-        setSession((s) => ({ ...(s || { id: activeId }), steps: d.steps || [], status: d.status }))
+        setSession((s) => ({
+          ...(s || { id: activeId }),
+          steps: d.steps || [],
+          status: d.status,
+          platform: d.provenance?.platform ?? s?.platform,
+          execution_mode: d.provenance?.execution_mode ?? s?.execution_mode,
+          account_id: d.provenance?.account_id ?? s?.account_id,
+        }))
       } catch (_) { /* ignore */ }
     })
     es.addEventListener('step', (e) => {
@@ -576,9 +626,14 @@ function AgentConsole() {
           ) : (
             <Card
               title={
-                <Space>
+                <Space wrap>
                   <span>目标：{session.goal}</span>
                   {statusTag && <Tag color={statusTag.color}>{statusTag.label}</Tag>}
+                  <ProvenanceTag
+                    platform={session.platform}
+                    execution_mode={session.execution_mode}
+                    account_id={session.account_id}
+                  />
                   {session.status === 'running' && (
                     <Tag color="processing" style={{ marginLeft: 4 }}>
                       <span style={{ display: 'inline-block', width: 6, height: 6, borderRadius: '50%', background: '#1890ff', marginRight: 6, animation: 'ant-status-processing 1.2s infinite' }} />

@@ -15,17 +15,20 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from app.config import settings
 from app.services.agent_runtime.session import (
-    AgentSession, AgentStep, AgentStepKind, AgentStepStatus,
+    AgentSession, AgentStep, AgentStepKind, AgentStepStatus, get_session_store,
 )
 from app.services.agent_runtime.tools import (
     AgentContext, get_tool_registry, TOOL_TO_ACTION,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -53,7 +56,7 @@ class AgentLoop:
         session.add_step(AgentStep(
             kind=AgentStepKind.OBSERVATION.value, text=res.observation,
             tool="observe_campaigns", result=res.data, status=AgentStepStatus.DONE.value))
-        return self._run(session, ctx)
+        return self._done(self._run(session, ctx))
 
     def approve(self, session: AgentSession, step_id: str, approved: bool,
                 reason: Optional[str], ctx: AgentContext) -> AgentSession:
@@ -70,7 +73,7 @@ class AgentLoop:
                     tool=tool.name, params=step.params, risk_level=step.risk_level,
                     status=AgentStepStatus.EXECUTED.value, result=res.data))
             session.status = "running"
-            return self._run(session, ctx)
+            return self._done(self._run(session, ctx))
         else:
             step.status = AgentStepStatus.REJECTED.value
             step.text += f"（已驳回：{reason or '用户拒绝'}）"
@@ -78,7 +81,7 @@ class AgentLoop:
             session.context.setdefault("rejected", []).append(
                 (step.tool, step.params.get("entity_id")))
             session.status = "running"
-            return self._run(session, ctx)
+            return self._done(self._run(session, ctx))
 
     def send_message(self, session: AgentSession, text: str,
                      ctx: AgentContext) -> AgentSession:
@@ -86,7 +89,7 @@ class AgentLoop:
             kind=AgentStepKind.THOUGHT.value,
             text=f"👤 用户：{text}", status=AgentStepStatus.DONE.value))
         session.status = "running"
-        return self._run(session, ctx)
+        return self._done(self._run(session, ctx))
 
     def redirect_run(self, session: AgentSession, ctx: AgentContext, text: str) -> AgentSession:
         """中途改向：清除中断标志，把新指令注入目标，开启新一轮 ReAct。"""
@@ -97,7 +100,15 @@ class AgentLoop:
             text=f"🔀 用户中途改向：{text}",
             status=AgentStepStatus.DONE.value))
         session.status = "running"
-        return self._run(session, ctx)
+        return self._done(self._run(session, ctx))
+
+    def _done(self, session: AgentSession) -> AgentSession:
+        """循环结束 / 中断后落库（Phase A1：状态可从 DB 读回），持久化失败不影响主流程。"""
+        try:
+            get_session_store().persist(session)
+        except Exception as e:
+            logger.warning("persist session failed: %s", e)
+        return session
 
     def reflect(self, ctx: AgentContext, goal: Optional[str] = None):
         """复盘：基于已沉淀的 Episode 记忆，提取启发式规则（Phase 2 反思层）。"""
@@ -198,11 +209,17 @@ class AgentLoop:
 
         # L1/L2/L3 → 提议，转人在环
         pred = self._predict(ctx, tool.name, decision.params)
+        provenance = {
+            "platform": getattr(ctx.connector, "platform", None),
+            "execution_mode": getattr(ctx.connector, "execution_mode", None),
+            "account_id": getattr(ctx.connector, "account_id", None) or None,
+        }
         session.add_step(AgentStep(
             kind=AgentStepKind.APPROVAL.value,
             text=f"提议{tool.name}：{_propose_text(tool, decision.params)}",
             tool=tool.name, params=decision.params, risk_level=tool.risk_level,
-            predicted_impact=pred, status=AgentStepStatus.PROPOSED.value))
+            predicted_impact=pred, status=AgentStepStatus.PROPOSED.value,
+            result={"provenance": provenance}))
         session.status = "awaiting_approval"
 
     # ============================ 决策 ============================ #
@@ -340,7 +357,8 @@ class AgentLoop:
             else:
                 threshold = _extract_roi_threshold(goal) or 1.0
             country = _extract_country(goal)
-            targets = [s for s in summary if s["roi"] < threshold and s["status"] == "ACTIVE"
+            targets = [s for s in summary if s.get("roi") is not None and s["roi"] < threshold
+                       and s["status"] == "ACTIVE"
                        and (not country or s["country"] == country)
                        and ("pause_campaign", s["campaign_id"]) not in rejected]
             if targets:
@@ -495,8 +513,13 @@ def _final_summary(session: AgentSession, ctx: AgentContext) -> str:
         lines.append("⏳ 待你审批：")
         lines += [f"  - {s.text}" for s in proposed]
     lines.append("📊 当前账户：")
-    lines += [f"  {s['campaign_id']:<12}{s['country']:<4}{s['status']:<8}"
-              f"roi={s['roi']:.2f} spend={s['spend']:.0f}" for s in summary] or ["  （无数据）"]
+    for s in summary:
+        r = s.get("roi")
+        roi_s = f"{r:.2f}" if isinstance(r, (int, float)) else "N/A"
+        lines.append(f"  {s['campaign_id']:<12}{s['country']:<4}{s['status']:<8}"
+                     f"roi={roi_s:<6}spend={s['spend']:.0f}")
+    if not summary:
+        lines.append("  （无数据）")
     return "\n".join(lines)
 
 

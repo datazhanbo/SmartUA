@@ -1,5 +1,160 @@
 # 更新日志
 
+## 未发布 - 2026-07-21 — 生产升级 Phase 1.2 执行模式在 API / SSE / 前端全链路显示
+
+### Added（新增）
+
+- **`AgentSession` provenance 字段**：新增 `platform / execution_mode / account_id`，直接写入会话对象；`AgentSessionStore.create()` 支持显式传入，`persist()` / `_row_to_session()` 通过 `context_json` 中的保留键 `_provenance` 完成落盘与回读，不引入新表 / 不触发 Alembic 迁移。
+- **API 端点 provenance 透传**：
+  - `POST /agent/sessions` 先解析目标连接器的 `platform / execution_mode / account_id` 再落库；live 缺凭证/SDK 时抛 `400`，永不静默回退 mock。
+  - `GET /agent/sessions/{id}/stream` 的 `snapshot` 与 `status` 事件带 `provenance: {platform, execution_mode, account_id}`。
+  - `GET /agent/autonomy/status` 新增 `execution_mode`。
+- **审批步骤 provenance 冻结**：`AgentLoop._dispatch()` 生成 `APPROVAL` 步骤时把连接器的 `platform / execution_mode / account_id` 写入 `step.result.provenance`，让"到底作用在哪个账户"随审批一起保存到 DB，事后审计可回放。
+- **前端 `ProvenanceTag` 常驻标识**（`frontend/src/pages/AgentConsole.jsx`）：
+  - 会话头：Mock/Sandbox/Live 徽标 + 平台 + 账户。
+  - 审批卡：从 `step.result.provenance` 读取，永远与 Agent 决策时的目标一致。
+  - 执行结果卡（`action` 步骤）：从 Phase 1.1 的 `_decorate_action_result` 装饰读取 `platform / execution_mode / account_id`。
+  - 主动巡检状态条：新增 execution_mode 徽标。
+- **`tests/test_session_persistence.py`**：新增 `test_session_provenance_persists_across_reload` 与 `test_session_provenance_defaults_are_none`，覆盖持久化回读一致性与 `_provenance` 保留键不外泄。
+
+### Changed（变更）
+
+- **`agent_default_platform` 与 `agent_execution_mode` 分离展示**：前端不再只显示"平台"，而是"平台 + 执行模式"，Mock 数据即使在 Live 模式的服务上也无法冒充真实结果。
+- **SSE 客户端合并策略**：`AgentConsole` 在 `snapshot` 事件时会用后端 provenance 覆盖本地缓存，避免用户刷新页面后短暂看到旧值。
+
+### Validation（验证）
+
+- `python3 -m pytest tests/ -v`：56 项全部通过（原 54 项 + 新增 2 项 provenance 持久化断言）。
+- `python3 scripts/smoke_phaseA.py`：A1/A2/A3 全部通过。
+- `python3 scripts/demo_phase4.py`：主动巡检、L0 自动执行、L1 审批、账户禁用告警、冷却去重、策略阈值、调度器全部通过。
+- `npx vite build`：前端构建成功（2456 KB，gzip 791 KB），无 JSX 报错。
+- 未做浏览器端到端点击验证（无本机浏览器沙箱访问）；需要 UI 交互回归时可执行 `npm run dev` + 后端 `uvicorn` 后手动过一遍。
+
+### 外部依赖阻塞
+
+- 无新增。Google/Meta live 真实链路仍需真实凭证 + SDK；本轮仍属 Phase 1.1 的验证遗留。
+
+---
+
+## 未发布 - 2026-07-21 — 生产升级 Phase 1.1 Connector 执行模式与 Fail-Closed
+
+### Added（新增）
+
+- **`BaseConnector.supported_modes` / `capabilities`**：所有连接器显式声明支持的执行模式（`mock` / `sandbox` / `live`）与能力（read / write / structure / simulate），构造时按 `execution_mode` 校验，模式不匹配立即抛 `ValueError`。
+- **`execution_mode` 参数贯通**：`BaseConnector.__init__` 与 `ConnectorFactory.get_connector` 均要求显式声明；`available_connectors()` 输出补充 `supported_modes` 与 `capabilities`。
+- **结果 provenance 装饰**：`_result_meta` / `_decorate_pull_result` / `_decorate_action_result` 三个 hook 在 `execute_pull` 与 `apply_action` 出口自动注入 `platform / execution_mode / account_id / is_mock / verified_at`，Mock 数据与写动作永久留痕。
+- **`settings.agent_execution_mode`**：新增 `Literal["mock", "sandbox", "live"]` 全局执行模式（默认 `mock`），生产环境需显式覆盖为 `live` 才会发起真实 API 调用。
+- **`tests/test_connectors_execution_mode.py`**：新增 16 项断言，覆盖 supported_modes 声明、unsupported-mode 拒绝、Google/Meta live fail-closed（缺凭证、缺 SDK）、Mock provenance 输出、工厂 metadata 暴露 supported_modes/capabilities。
+
+### Changed（变更）
+
+- **Google Ads live 严格 fail-closed**：凭证不齐或 `google-ads` SDK 不可用时构造直接抛错，不再静默回退 mock；`auth()` 移除“credentials incomplete → mock mode”日志。
+- **Meta live 严格 fail-closed**：`execution_mode="live"` 时缺 `facebook_business` SDK 或 `access_token` 直接抛错；`pull_structure` 与 4 个写动作按 `execution_mode` 判定 mock/live，不再基于 SDK 全局标志静默切换。
+- **TikTok / AppsFlyer 声明 mock-only**：真实 API 未实现前 `execution_mode="live"` 立刻抛错，杜绝“认证成功但从未接触真实平台”的假成功。
+- **`agent_default_platform` 回退为 `mock`**：与执行模式默认 `mock` 对齐，避免真实平台默认；生产环境需在 `.env` 显式指定平台 + `agent_execution_mode="live"`。
+- **`agent.py::_make_ctx` / `autonomy.py::scan` / `connector_service`（3 处）**：全部按 `settings.agent_execution_mode` 传参，禁止旧的隐式回退。
+- **`resolve_credentials()`**：仅负责解析凭证，不再决定回退策略；文档、`scripts/smoke_phaseA.py`、`scripts/demo_phase4.py`、`scripts/verify_google_live.py`、`tests/test_connector_factory.py`、`tests/test_autonomy_engine.py` 全部改为显式声明 `execution_mode`。
+
+### Validation（验证）
+
+- `python3 -m pytest tests/ -v`：54 项全部通过（原 38 项 + 新增 16 项 execution_mode 断言）。
+- `python3 scripts/smoke_phaseA.py`：A1/A2/A3 全部通过；execution_mode 显式声明未破坏 Mock 拉取/结构/影响接地。
+- `python3 scripts/demo_phase4.py`：主动巡检、L0 自动执行、L1 审批、账户禁用告警、冷却去重、策略阈值与调度器均通过。
+- Google/Meta live 真实链路仍属外部依赖阻塞（无 SDK 与 live 凭证）；本次仅验证 fail-closed 行为。
+
+---
+
+## 未发布 - 2026-07-21 — 生产升级 Phase 0.2 Alembic 数据库迁移
+
+### Added（新增）
+
+- **Alembic 数据库迁移框架**：`backend/alembic/` 初始化，含 `alembic.ini` 和 `env.py`（SQLite 兼容 batch 模式 + `compare_type=True`）。
+- **Baseline 迁移 `76c3bd1f529f`**：覆盖全部 33 张 model 表，按依赖顺序生成，含所有索引、唯一约束和复合索引。
+- **启动时 Schema 版本检查**（`main.py`）：已迁移库验证 revision；有业务表但无 `alembic_version` 的库自动 `create_all` 补齐 + stamp；全新空库 `create_all` + stamp head。
+- **6 项迁移 pytest**（`test_migration.py`）：空库 upgrade head、alembic check、alembic current、stamp + upgrade、数据保留、schema 表完整性。
+
+### Validation（验证）
+
+- `python3 -m pytest tests/ -v`：38 项全部通过（原 32 项 + 6 项迁移）。
+- `python3 scripts/smoke_phaseA.py`：全部通过。
+- `python3 scripts/demo_phase4.py`：全部通过。
+
+---
+
+## 未发布 - 2026-07-21 — 生产升级 Phase 0.1 回归基线
+
+### Added（新增）
+
+- 新增 32 项 pytest 回归测试，覆盖 Connector Factory、Agent Session 持久化、Episodic Memory、Autonomy Store 与 Autonomy Engine。
+- `backend/requirements.txt` 补齐代码和测试实际使用的 `httpx`、`APScheduler`、`pytest` 依赖。
+
+### Fixed（修复）
+
+- 修复 `smoke_phaseA.py` 与 `demo_phase4.py` 直接运行时无法导入 `app` 的路径问题。
+- Phase 4 演示显式使用 `mock` 平台，避免默认 Google 无数据造成假失败。
+
+### Validation（验证）
+
+- `python3 -m pytest tests/ -v`：32 项全部通过。
+- `python3 scripts/smoke_phaseA.py`：A1 持久化、A2 TikTok 注册、A3 Connector 接地全部通过。
+- `python3 scripts/demo_phase4.py`：主动巡检、L0 自动执行、L1 审批、账户禁用告警、冷却去重、策略阈值与调度器全部通过。
+- 以上结果仅证明 SQLite/Mock 基线。Google Ads live 因缺少 SDK 与凭证、Meta live 因缺少 SDK 与凭证、TikTok live 因真实 API 尚未实现而阻塞，均未标记为真实链路验收通过。
+
+---
+
+## v1.8.0 - 2026-07-11 — Phase A 真实数据地基（持久化 + 真实渠道 + 真实归因接地）
+
+> 本版本落地「迭代路线图 Phase A」——消除最大工程风险「重启即失」，并把接真实渠道 / 真实归因的代码与护栏备好（Mock 待命，条件一到即切）。这是让 Agent 从"沙盘"走向"真实数据"的地基。
+
+### Added（新增）
+
+- **状态持久化（A1）——双轨存储（内存缓存 + SQLite）**
+  - `backend/app/db/base.py`：SQLite 启用 **WAL 日志模式 + `busy_timeout=5000`**，使自有 `SessionLocal` 与请求事务可并发读写（支撑后台 Agent 线程 + 请求线程同时落库）。
+  - `backend/app/models/agent_runtime.py`（新增）：5 张持久化表 `AgentSessionDB` / `AgentStepDB` / `EpisodeDB` / `AutonomyAlertDB` / `AutonomyScanDB`，注册进 `Base.metadata`（`main.py` 导入确保 `create_all` 建表）。
+  - `session.py`：`AgentSessionStore` 改为双轨——`_cache: Dict` 快路径（SSE 实时推流依赖原地修改）+ SQLite 持久化（`persist()` upsert 会话 + 先删后插步骤；`get/list/delete/clear` 经 DB）。
+  - `memory.py`：`EpisodicMemory` 改为双轨——`_eps` 缓存 + `_ensure_loaded()` 从 `EpisodeDB` 载入；`record()` 写库；`clear()` 清表 + 缓存。
+  - `autonomy.py`：`AutonomyStore` 改为双轨——`_ensure_loaded()` 载入 scans/alerts；`add_alert()` 写库；审批回写 `_persist_alert()`；`clear()`。
+  - `loop.py`：`start/approve/send_message/redirect_run` 经 `_done()` 调 `get_session_store().persist(session)`（try/except 不阻断主流程）；`api/v1/agent.py` 的 `abort`/`redirect`/异常分支补 `persist`。
+  - **验收**：重启后端，会话 / 记忆 / 告警全部可读回（消除「重启即失」）。
+
+- **真实渠道 Connector（A2）——代码先行、Mock 待命**
+  - `backend/app/services/connectors/tiktok.py`（新增）：`TikTokConnector(BaseConnector)` 完整实现（真实 API 路径预留，当前 `access_token` 缺失自动走 Mock）。
+  - `connectors/__init__.py`：注册 `tiktok → TikTokConnector`（`ConnectorFactory` 支持）。Meta / Google Connector 抽象路径同已就绪；Meta 账号解封只需 `config.agent_default_platform="meta"`，上层零改动。
+
+- **真实归因接地（A3）——让 observe / detector / rule_engine 在真实数据上可用**
+  - `connectors/base.py`：`BaseConnector` 新增三个 Agent 辅助方法的通用实现：
+    - `current_summary()`：聚合 `FactMediaDaily` 最新一天（按 `campaign_id` / `country` 分组），`roi` 从 `FactMMPDaily.roi_d7` 取（有则用之，无则 `None`）；`status` 默认 ACTIVE。
+    - `account_status()`：默认 `"ok"`。
+    - `simulate_impact()`：返回全 0 的 `ImpactEstimation`（7 维，避免无因果引擎时崩溃）。
+  - `MockMediaConnector` 用 `SimulationEngine` 覆盖这三者，提供真实因果实现。
+  - **roi 安全保护**：检测器 / 规则引擎对 `roi is None` 跳过（真实数据缺 MMP 归因时不误报 ROI 跌破）。
+  - **验收**：Meta / TikTok `execute_pull` 成功、`current_summary` 非空；缺 MMP 时 `roi=None` 不崩溃；`account_status` / `simulate_impact` 不报错；`db=None` 时安全返回 `[]`。
+
+- **开发验证**：`backend/scripts/smoke_phaseA.py`（隔离 DB，13 项断言全 PASS：A1 重启可读回 / A2 tiktok 注册 / A3 真实连接器接地）。
+
+### Changed（变更）
+
+- LLM 路由默认策略、SSE 流式展示等沿用 v1.7.0，无回归。
+
+### 真实 Google Ads 链路升级（A2 收尾，接续 09:11）
+
+- **Google Ads 连接器重写为真实 SDK 实现 + Mock 回退**：`connectors/google.py` 的 `GoogleAdsConnector` 现在在「凭证齐全 且 运行环境已装 `google-ads` SDK」时走真实 Google Ads API（`auth` / `pull` / `update_campaign_status` / `update_campaign_budget` / `update_adset_bid` / `rotate_creative` 均有真实 GAQL mutate + Mock 回退）；凭证缺失、或 SDK 不可用（如本沙箱）时**自动回退 Mock**，保证系统不崩、可测试。
+- **凭证解析 `resolve_credentials(platform, db, app_id)`**（新增于 `connectors/__init__.py`）：优先 `connector_credentials` 库表（active + verified），回退 `config.google_*`（`config.google_credentials_dict` 属性聚 6 字段）；均无则 `{}` → Mock。
+- **接线**：`api/v1/agent.py` 的 `_make_ctx` 与 `agent_runtime/autonomy.py` 的 `scan` 原传空 `credentials={}`（断线），已改为经 `resolve_credentials` 注入；`connector_service._get_default_credentials` 库表无凭证时为 google 回退 `config.google_*`。
+- **默认平台切换**：`config.agent_default_platform` → `"google"`（真实链路就绪；缺凭证自动回退 Mock）。`backend/.env.example` 增补 `GOOGLE_*` 凭证段与说明。
+- **沙箱硬约束**：本沙箱无法 `pip install google-ads` / `grpcio`（解压 OOM exit 137），故**真实链路仅能在装了 google-ads 的机器上激活**；代码层面已就绪，填凭证 + 装 SDK 即切换。验证（system python3.14，27 项全 PASS）：7 文件 py_compile 通过、空凭证与「凭证齐全但 SDK 缺失」两种情形均正确回退 Mock、`pull` / 四个写动作不崩、6 关键模块 import 全过。
+
+### Fixed（修复）
+
+- 修复「重启即失」：会话 / 记忆 / 告警流 / 扫描历史从进程内单例升级为 SQLite 持久化（与已落盘的 `StrategyStore` JSON 一并消除所有重启丢失风险）。
+
+### Docs（文档）
+
+- `docs/AGENT_ITERATION_ROADMAP.md`：Phase A（A1 / A2 / A3）标记已完成，状态由「规划稿」改为「执行中」。
+- `backend/scripts/smoke_phaseA.py`：Phase A 冒烟测试。
+
+---
+
 ## v1.7.0 - 2026-07-11 — ark 推理服务对接 & 流式展示 & 外部检索
 
 > 本版本将智能体控制台从「桩式规则引擎」升级为「真实大模型驱动的流式 Agent」，并完成两项关键能力补全：**可打断**、**外部市场检索**。
@@ -391,6 +546,12 @@
 - [x] 外部市场检索 market_research 工具（真实检索 + 基准库兜底）
 - [x] 可打断 & 中途改向（abort / redirect 人机协作 steering）
 
+### ✅ v1.8.0 (已完成, 2026-07-11) — Phase A 真实数据地基
+- [x] 状态持久化（A1）：会话 / 记忆 / 告警流 双轨存储落库 SQLite，重启不丢
+- [x] 真实渠道 Connector（A2）：TikTokConnector 实现 + 注册；Meta / Google 路径就绪，Mock 待命
+- [x] 真实归因接地（A3）：BaseConnector.current_summary / account_status / simulate_impact 通用实现，缺 MMP 时 roi=None 安全
+- [x] smoke_phaseA.py 13 项断言全 PASS
+
 ### ✅ v1.6.0 (已完成, 2026-07-10) — Phase 4 主动式自治
 - [x] APScheduler 周期巡检 + 5 类异常检测（CPI/ROI/疲劳/花费/账户被封）
 - [x] 分级处置：L0 自动执行、L1/L2 人在环审批、仅通知不自动改动
@@ -398,7 +559,7 @@
 - [x] 冷却去重，避免重复打扰
 
 ### ⏳ v2.0 (远期) — 生产化与增强
-- [ ] Episodic Memory / 会话仓 / 告警流落库（目前进程内单例，重启即失）
+- [x] Episodic Memory / 会话仓 / 告警流落库（已在 v1.8.0 完成：双轨 SQLite 持久化，重启不丢）
 - [ ] 主动汇报升级：日报 / 异动摘要推送（邮件 / 企微 / 飞书）
 - [ ] Meta 账户恢复后切回真实 Connector（上层零改动）
 - [ ] 四层数仓 ODS/DWD/DWS/ADS + ClickHouse 加速

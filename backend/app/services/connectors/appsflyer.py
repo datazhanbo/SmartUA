@@ -8,21 +8,26 @@ logger = logging.getLogger(__name__)
 
 
 class AppsFlyerConnector(BaseConnector):
-    """AppsFlyer MMP 归因连接器"""
+    """AppsFlyer MMP 归因连接器（Phase 1.1：mock 专用，真实 API 未实现前拒绝 live）。"""
 
     platform = "appsflyer"
     source_type = "mmp"
     rate_limit = 200  # 每小时 200 次请求
+    supported_modes = ("mock",)
+    capabilities = {
+        "read": True,
+        "write": False,
+        "structure": False,
+        "simulate": False,
+    }
 
-    def __init__(self, db, app_id, credentials):
-        super().__init__(db, app_id, credentials)
+    def __init__(self, db, app_id, credentials, execution_mode: str = "mock"):
+        super().__init__(db, app_id, credentials, execution_mode=execution_mode)
         self.api_key = credentials.get("api_key")
         self.app_id_list = credentials.get("app_ids", [])
 
     def auth(self) -> bool:
         """认证 - API Key"""
-        if not self.api_key:
-            logger.warning("AppsFlyer api_key not provided, using mock mode")
         return True
 
     def pull(self,

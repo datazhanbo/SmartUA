@@ -4,9 +4,8 @@
 复盘、提取启发式规则，并反哺规划（让 Agent 越做越准）。
 
 设计要点：
-- 进程内单例（与 SessionStore / 模拟引擎同源），跨会话持久 —— 这正是「跨任务学习」的载体：
-  Agent 在本周 A 账户上踩过的坑，下周换 B 账户时仍能调用。
-- 无 DB 依赖（演示友好）；生产应落库为 EpisodicMemory 表（见 docs/CHANGELOG 风险项）。
+- Phase A1 起：Episode 持久化到 SQLite（agent_episodes 表），跨进程重启保留；
+  进程内 `_eps` 作为缓存，首次访问时从 DB 载入。
 - 同时被 tools._write（执行后记录）与 loop（规划前 consult / 终态 reflect）消费。
 
 Episode 字段说明：
@@ -21,9 +20,31 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from app.db.base import SessionLocal
+from app.models.agent_runtime import EpisodeDB
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_dt(v):
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        return v
+    try:
+        return datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+    except Exception:
+        return datetime.utcnow()
+
+
+def _fmt_dt(v):
+    if v is None:
+        return None
+    if isinstance(v, str):
+        return v
+    return v.isoformat()
 
 
 @dataclass
@@ -53,22 +74,75 @@ class Episode:
 
 
 class EpisodicMemory:
-    """进程内 Episode 仓库（跨会话持久）。"""
+    """Episode 仓库：进程内缓存（快路径）+ SQLite 持久化（重启不丢，Phase A1）。"""
 
     def __init__(self):
         self._eps: List[Episode] = []
+        self._loaded = False
+
+    # ----- 持久化辅助 -----
+    def _ensure_loaded(self):
+        if self._loaded:
+            return
+        db = SessionLocal()
+        try:
+            rows = db.query(EpisodeDB).order_by(EpisodeDB.timestamp).all()
+            self._eps = [self._row_to_ep(r) for r in rows]
+        finally:
+            db.close()
+        self._loaded = True
+
+    @staticmethod
+    def _row_to_ep(r: EpisodeDB) -> Episode:
+        return Episode(
+            episode_id=r.episode_id,
+            timestamp=_fmt_dt(r.timestamp) or _now(),
+            session_id=r.session_id,
+            goal=r.goal or "",
+            action=r.action or "",
+            action_label=r.action_label or "",
+            intent_class=r.intent_class or "",
+            params=r.params_json or {},
+            pre_state=r.pre_state_json or {},
+            impact=r.impact_json or {},
+            outcome=bool(r.outcome) if r.outcome is not None else True,
+            note=r.note or "",
+        )
 
     def record(self, ep: Episode) -> Episode:
+        self._ensure_loaded()
         self._eps.append(ep)
+        db = SessionLocal()
+        try:
+            db.add(EpisodeDB(
+                episode_id=ep.episode_id,
+                timestamp=_parse_dt(ep.timestamp),
+                session_id=ep.session_id,
+                goal=ep.goal,
+                action=ep.action,
+                action_label=ep.action_label,
+                intent_class=ep.intent_class,
+                params_json=ep.params,
+                pre_state_json=ep.pre_state,
+                impact_json=ep.impact,
+                outcome=ep.outcome,
+                note=ep.note,
+            ))
+            db.commit()
+        finally:
+            db.close()
         return ep
 
     def all(self) -> List[Episode]:
+        self._ensure_loaded()
         return list(self._eps)
 
     def recent(self, n: int = 50) -> List[Episode]:
+        self._ensure_loaded()
         return self._eps[-n:]
 
     def by_action(self, action: str) -> List[Episode]:
+        self._ensure_loaded()
         return [e for e in self._eps if e.action == action]
 
     def has_experience(self, action: str) -> bool:
@@ -78,6 +152,7 @@ class EpisodicMemory:
     # 聚合统计：反思与规划的基础
     # ----------------------------------------------------------------- #
     def aggregate(self) -> Dict[str, Any]:
+        self._ensure_loaded()
         out: Dict[str, Any] = {}
         for action in {e.action for e in self._eps}:
             eps = self.by_action(action)
@@ -105,18 +180,30 @@ class EpisodicMemory:
         若历史加预算的 7d 平均 ΔROI 转负（越多花费换越少 ROI），说明边际递减已现，
         将默认增幅收敛到 ≤10%，避免无效扩量。无历史则返回默认上限。
         """
+        self._ensure_loaded()
         eps = self.by_action("adjust_budget")
         if not eps:
             return default_cap
         avg = sum(e.avg_delta_roi_7d() for e in eps) / len(eps)
         return default_cap if avg >= roi_threshold else min(default_cap, 10.0)
 
+    def clear(self) -> None:
+        """清空全部 Episode（演示 / 测试用）。"""
+        db = SessionLocal()
+        try:
+            db.query(EpisodeDB).delete()
+            db.commit()
+        finally:
+            db.close()
+        self._eps = []
+        self._loaded = True
+
 
 _memory: Optional[EpisodicMemory] = None
 
 
 def get_memory() -> EpisodicMemory:
-    """全局记忆单例（与 SessionStore / 模拟引擎同源，跨会话持久）。"""
+    """全局记忆单例（与 SessionStore / 模拟引擎同源，跨会话 + 跨重启持久）。"""
     global _memory
     if _memory is None:
         _memory = EpisodicMemory()

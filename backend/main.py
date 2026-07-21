@@ -10,12 +10,85 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.db.base import engine, Base
 from app.api.v1 import auth, apps, data, intent, llm, data_management, connectors, campaign as campaign_router, agent as agent_router
+from app.models import agent_runtime as _agent_runtime_models  # noqa: F401  注册 Agent 运行时持久化表到 Base.metadata
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("smartua")
 
-# 创建数据库表
-Base.metadata.create_all(bind=engine)
+# ── Schema 迁移检查 ────────────────────────────────────────────────────
+# Phase 0.2: 启动时检查 Alembic 迁移版本。
+# - 若库中已有 alembic_version 表（即已迁移），则验证当前 revision 为 head；
+# - 若库中无任何表（全新库），则通过 create_all() 建表并 stamp 为 head；
+# - 若库中有业务表但无 alembic_version（从 v1.8 之前升级），则通过 create_all()
+#   补齐缺失表并 stamp 为 head，保证数据不丢失。
+# 过渡期结束后（所有环境均经过一次迁移），可移除 create_all() 回退，仅保留迁移检查。
+def _ensure_schema() -> None:
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(engine)
+    existing_tables = set(inspector.get_table_names())
+    model_tables = set(Base.metadata.tables.keys())
+    has_alembic_version = "alembic_version" in existing_tables
+
+    if has_alembic_version:
+        # 已迁移库：验证 revision 为 head
+        try:
+            from alembic.config import Config
+            from alembic.script import ScriptDirectory
+            alembic_cfg = Config("alembic.ini")
+            script = ScriptDirectory.from_config(alembic_cfg)
+            head_revision = script.get_current_head()
+
+            with engine.connect() as conn:
+                row = conn.execute(text("SELECT version_num FROM alembic_version")).scalar()
+            if row == head_revision:
+                logger.info("Schema 迁移版本验证通过: %s", row)
+                return
+            else:
+                logger.warning(
+                    "Schema 迁移版本不匹配: 当前 %s, 期望 %s。尝试 upgrade...",
+                    row, head_revision,
+                )
+                _run_alembic_upgrade()
+        except Exception as exc:
+            logger.warning("Alembic 版本检查失败: %s", exc)
+            logger.warning("create_all() 回退建表...")
+            Base.metadata.create_all(bind=engine)
+    elif existing_tables:
+        # 有业务表但无迁移版本：从 v1.8 之前升级，stamp 为 head
+        logger.info(
+            "检测到 %d 张业务表但无 alembic_version，执行 create_all() 补齐 + stamp",
+            len(existing_tables),
+        )
+        Base.metadata.create_all(bind=engine)
+        _stamp_head()
+    else:
+        # 全新空库：create_all() 建表 + stamp
+        logger.info("全新空库，create_all() 建表 + stamp head")
+        Base.metadata.create_all(bind=engine)
+        _stamp_head()
+
+
+def _run_alembic_upgrade() -> None:
+    from alembic.config import CommandLine
+    CommandLine().run(["alembic", "upgrade", "head"])
+
+
+def _stamp_head() -> None:
+    """Stamp the current database as at the Alembic head revision."""
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+    from alembic.command import stamp
+
+    alembic_cfg = Config("alembic.ini")
+    script = ScriptDirectory.from_config(alembic_cfg)
+    head = script.get_current_head()
+    if head:
+        stamp(alembic_cfg, head)
+        logger.info("Schema 已 stamp 为 %s", head)
+
+
+_ensure_schema()
 
 
 @asynccontextmanager
@@ -46,7 +119,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="SmartUA Platform API",
     description="智能投放平台 - 支持大模型意图识别、操作安全分级控制、闭环学习优化（迈向 Agentic）",
-    version="1.7.0",
+    version="1.8.0",
     lifespan=lifespan,
 )
 
@@ -75,7 +148,7 @@ app.include_router(agent_router.router, prefix="/api/v1")
 async def root():
     return {
         "name": "SmartUA Platform API",
-        "version": "1.6.0",
+        "version": "1.8.0",
         "description": "智能投放平台 - 大模型驱动的投放优化系统（迈向 Agentic Ad Platform）",
         "features": [
             "大模型意图识别（自然语言 -> 投放操作）",

@@ -1,5 +1,5 @@
 from pydantic_settings import BaseSettings
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Literal
 from pathlib import Path
 import json
 
@@ -39,6 +39,15 @@ class Settings(BaseSettings):
     local_model_base_url: str = "http://localhost:8000/v1"
     local_model_name: str = "qwen2.5-72b-instruct"
 
+    # ===== Google Ads 连接器凭证（真实渠道；缺省时自动回退 mock） =====
+    # 填入后 SmartUA 即走真实 Google Ads API（需运行环境能安装 google-ads SDK / grpcio）。
+    google_developer_token: Optional[str] = None
+    google_client_id: Optional[str] = None
+    google_client_secret: Optional[str] = None
+    google_refresh_token: Optional[str] = None
+    google_customer_id: Optional[str] = None        # 运营客户 ID（数字，无连字符）
+    google_login_customer_id: Optional[str] = None   # MCC 登录客户 ID（可选）
+
     # 路由策略: best_fit / fastest / least_cost / highest_quality
     llm_routing_strategy: str = "best_fit"
 
@@ -46,8 +55,12 @@ class Settings(BaseSettings):
     llm_fallback_enabled: bool = True
 
     # ===== Agent Loop（Phase 1）配置 =====
-    # 默认执行平台：Meta 账户被封期间用 mock 因果模拟引擎作为数据土壤；
-    # Meta 恢复后改为 "meta" 即可，上层 Agent Loop 与意图引擎零改动。
+    # Phase 1.1：显式声明连接器的执行目标；不再由凭证/SDK 缺失静默切换。
+    # - mock：使用因果模拟数据（默认，安全，绝不接触真实媒体资源）
+    # - sandbox：使用平台沙盒 API（当前无实现，作为占位）
+    # - live：使用真实媒体 API；缺凭证/SDK/权限必须 fail-closed，绝不回退 mock
+    agent_execution_mode: Literal["mock", "sandbox", "live"] = "mock"
+    # 默认执行平台：默认 mock，配合 execution_mode=live 且指定真实平台使用。
     agent_default_platform: str = "mock"
     # 单轮决策最大步数，防止 ReAct 无限循环
     agent_max_steps: int = 15
@@ -163,6 +176,22 @@ class Settings(BaseSettings):
                 },
             ]
         }
+
+    @property
+    def google_credentials_dict(self) -> Dict[str, Any]:
+        """汇聚 google_* 凭证字段为连接器所需 dict（仅含非 None 项）。
+
+        供 resolve_credentials 在库表无凭证时回退；为空则 GoogleAdsConnector 自动走 mock。
+        连接器期望的 key 为 client_id/client_secret/refresh_token/developer_token/
+        customer_id/login_customer_id（即去掉 google_ 前缀）。
+        """
+        creds: Dict[str, Any] = {}
+        for key in ("google_developer_token", "google_client_id", "google_client_secret",
+                    "google_refresh_token", "google_customer_id", "google_login_customer_id"):
+            val = getattr(self, key, None)
+            if val:
+                creds[key.replace("google_", "")] = val
+        return creds
 
 
 settings = Settings()
