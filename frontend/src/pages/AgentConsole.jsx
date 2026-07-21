@@ -360,13 +360,36 @@ function AgentConsole() {
 
   // Agent 运行实时流：用 SSE 订阅会话步骤（后端 Loop 在后台执行，逐步推送
   // thought/observation/action…，避免整轮跑完才一次性返回）。EventSource 自动重连。
+  // Phase 2.2：先用 JWT 换一次性 ticket，再拿 ticket 打开 SSE；长期 JWT 不再进 URL。
   useEffect(() => {
     if (!activeId) return
-    const token = localStorage.getItem('token') || ''
-    const url = `/api/v1/agent/sessions/${activeId}/stream?token=${encodeURIComponent(token)}`
-    const es = new EventSource(url)
-    esRef.current = es
+    let es = null
+    let cancelled = false
+    ;(async () => {
+      let ticket = ''
+      try {
+        const resp = await agentAPI.createStreamTicket(activeId)
+        ticket = resp?.ticket || ''
+      } catch (e) {
+        // ticket 端点不可用（如后端还没升级）：留空即空 ticket，后端会返回 401
+        console.warn('createStreamTicket failed:', e?.response?.status)
+      }
+      if (cancelled) return
+      const url = `/api/v1/agent/sessions/${activeId}/stream?ticket=${encodeURIComponent(ticket)}`
+      es = new EventSource(url)
+      esRef.current = es
+      wireStreamHandlers(es)
+    })()
+    return () => {
+      cancelled = true
+      if (es) es.close()
+      esRef.current = null
+    }
+    // wireStreamHandlers 定义在下方 useEffect 之外的常规函数中
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeId])
 
+  function wireStreamHandlers(es) {
     es.addEventListener('snapshot', (e) => {
       try {
         const d = JSON.parse(e.data)
@@ -412,12 +435,7 @@ function AgentConsole() {
     es.onerror = () => {
       // EventSource 会自动重连；终态会话由 end 事件关闭，这里不主动关闭
     }
-
-    return () => {
-      es.close()
-      esRef.current = null
-    }
-  }, [activeId])
+  }
 
   const refreshSessions = async () => {
     try {

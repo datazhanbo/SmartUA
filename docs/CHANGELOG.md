@@ -1,5 +1,193 @@
 # 更新日志
 
+## 未发布 - 2026-07-21 — 生产升级 Phase 3.3 Dispatcher + 状态回读
+
+### Added（新增）
+
+- **`backend/app/services/agent_runtime/dispatcher.py`**：同步 `Dispatcher.dispatch_and_verify()` 驱动 `AgentActionDB` 走 `mint_or_get → approved → dispatching → media_call → accepted → verify → verified/unknown/failed` 状态机。判定钩子 `_default_judge`：`success=True→accepted`、`success=False→failed`、其他 → `unknown`（不冒充成功）。`_verify_state` 覆盖 `update_campaign_status`（严格比对 status）和 `update_campaign_budget`（相对差 ≤ 5%）。`reconcile()` 收敛 `unknown` 动作 → `verified` / `failed`。
+- **`BaseConnector.read_state(entity_id)`**：默认从 `current_summary()` 匹配 `campaign_id` 派生 `{status, daily_budget, roi, spend, cpi}`，真实 Connector 可以按需覆盖走原生 `campaigns.get()`。
+- **`AgentLoop._execute_approved_write` / `_execute_l0_write` / `_dispatch_via_action_store`**：审批通过或 L0 自动的写动作从"直接调 tool.handler"改为"包 tool.handler 为 media_call，交 Dispatcher 走状态机"。ACTION step 的 `data` 追加 `dispatch: {state, action_id, observation}`，前端与审计对账都能看到派发结果。
+- **`backend/tests/test_dispatcher.py`**：14 项测试 —— 幸福路径 verified + 幂等只叫一次媒体 / verified 短路阻止二次派发 / 媒体异常 → unknown / 媒体明确 success=False → failed / 返回值歧义 → unknown / read_state None → unknown / read_state 不匹配 → unknown / 无 entity_id + 无 read_state 停在 unknown / 预算相对差 ≤ 5% verified / 预算偏离 5% unknown / reconcile 三条路径（unknown→verified、unknown→failed、still unknown）+ reconcile 对非 unknown 状态为 no-op。
+
+### Changed（变更）
+
+- **`AgentLoop.approve()`**：审批通过分支从"`res = tool.handler(step.params, ctx); add_step(ACTION)`"改为"`self._execute_approved_write(...)`"。ctx 无 DB（demo 脚本）或工具不在 `TOOL_TO_ACTION` 映射时回退旧路径，保证 `scripts/demo_phase4.py` 等无 DB 场景仍可跑。
+- **`AgentLoop._dispatch()` L0 写工具分支**：同样接入 Dispatcher。原本 L0 直接执行，现在也会生成 `AgentActionDB` 走状态机 —— 即便自动执行也保留幂等 + 状态可解释性。
+
+### Rationale（设计原因）
+
+- **为什么继续同步、不上 durable outbox**：路线图 3.3 原文提到"durable outbox + lease worker"，但 SmartUA 目前是 SQLite 单进程 + 单 API 副本。在这里强行引入 outbox 表 + 独立 worker 会：(a) 让本可以随 API 事务原子提交的动作变成两段提交、(b) 增加"worker 死了动作卡住"的新故障模式、(c) 引入 SQLite 不适配的 lease/锁语义。因此把 outbox + worker 明确划入 Phase 5.2 —— 那时同步已迁到 PostgreSQL、多副本部署、有真实并发压力。Phase 3.3 只保证"状态机 + 幂等 + 回读 + 对账"这些无论是否 outbox 都成立的不变量。
+- **为什么 media_call 包装 tool.handler**：不破坏既有 `IntentExecution` + `ActionLog` 审计链（`tool.handler` 内部的 `_record_execution` 保持不动），dispatcher 只往上加一层动作实体和状态机。审计仍然由业务侧写，而"这条动作是否真的落到媒体、是否需要对账"由 dispatcher 判定。
+- **回读判定阈值**：`update_campaign_budget` 用 5% 相对差而不是精确相等，因为真实媒体的预算取整（Google 到分、TikTok 到 cent）会带来小额尾差；5% 覆盖 fen/cent 取整而不至于放走"改错一个数量级"。`bid` / `rotate_creative` 目前没有可读回的字段，只要 `read_state` 不为 None 即视为 verified，等 Phase 4 用 observed_impact 做归因验证。
+- **`unknown` 优先于 `failed`**：只要没有明确证据说媒体拒绝了动作（`success=False`），就停在 `unknown` 等对账，而不是自作主张标记 failed。这是"永不双发媒体"原则的对立面 —— 宁可等一轮 reconcile 也不能把还在飞的动作误判为失败然后触发人工重试。
+
+### Validation（验证）
+
+- `python3 -m pytest tests/ -q`：**102 项全部通过**（88 → 102，新增 14 项 Phase 3.3 dispatcher 测试）。既有 88 项零回归。
+- `python3 -c "from app.services.agent_runtime.dispatcher import Dispatcher, get_dispatcher"`：模块可导入，`get_dispatcher()` 单例可用。
+- 用例 `test_happy_path_reaches_verified_and_calls_media_once` 显式断言 `call_count == 1` —— 重复 `dispatch_and_verify(...)` 相同 idempotency 不会二次调用媒体。
+- 用例 `test_reconcile_unknown_to_verified` 模拟"媒体已 accept 但首次 read_state 拿到 None → unknown；对账时状态到位 → verified"，覆盖路线图验收要求"模拟 media 已执行但响应丢失，动作最终经对账变为 verified，且不产生第二次预算变更"。
+
+### 已知遗留（进入 Phase 4）
+
+- **同步派发未持久化 in-flight 动作**：进程崩溃时不会双发媒体（幂等键仍生效），但可能有更多 `unknown` 需要 reconcile 一次。Phase 5.2 通过 durable outbox + worker lease 消除。
+- **`IntentExecution` / `ActionLog` 软链接未回写**：`AgentActionDB.intent_execution_id` / `action_log_id` 字段已在 Phase 3.1 建好；但 dispatcher 目前不把 `_record_execution` 生成的 id 写回 action。属于审计反查便利性问题，不影响状态机正确性 —— Phase 4 收集 observed_impact 时会顺手补上。
+- **`read_state()` 默认实现依赖 `current_summary()`**：Google/TikTok 真实 Connector 目前也只覆盖 `current_summary()`，因此回读的粒度和新鲜度受限（当日聚合 vs 实时）。Phase 6 只读工具扩充时会给 Google Connector 落 native `campaigns.get()` 路径。
+- **无 DB 场景仍走旧路径**：`ctx.db is None` 或 `tool.name not in TOOL_TO_ACTION` 时 `_dispatch_via_action_store` 回退直接调 handler。生产运行时始终有 DB 且授权强制持库；此路径仅保留给 `scripts/demo_phase4.py`。
+
+---
+
+## 未发布 - 2026-07-21 — 生产升级 Phase 3.2 审批过期与执行前重校验
+
+### Added（新增）
+
+- **审批过期时效**：`settings.agent_approval_ttl_seconds`（默认 900s）+ `AgentStepDB.expires_at`（DateTime，nullable）。`AgentLoop._dispatch()` 在生成 L1/L2/L3 APPROVAL 步骤时冻结 `expires_at = now + ttl`；`AgentStep` pydantic 同步暴露 `expires_at` 字符串。
+- **执行前状态漂移校验**：`settings.agent_approval_drift_pct`（默认 0.20 = 20%）+ `AgentStepDB.snapshot_json`（JSON，nullable）。提案时冻结实体 `{roi, spend, status, daily_budget}` 快照；批准后 Loop 重新调用 `connector.current_summary()` 取当前状态，`_detect_drift()` 检查任一数字指标相对变化超阈值或 `status` 直接翻转均视为漂移。
+- **`POST /agent/sessions/{id}/approve` 409 语义**：批准前若步骤 `status != proposed` 或 `expires_at` 已过，返回 `409 {error: approval_expired, expires_at, message}`，避免异步 loop 无谓入队。
+- **`tests/test_approval_expiry_drift.py`**：10 项测试 —— 提案冻结 snapshot + expires_at；快照跨 Session Store 单例重建保留；过期跳过执行 + 加观察 + 记入 rejected；漂移超阈值跳过执行 + snapshot vs current diff 观察；status 翻转视为漂移；正常路径仍执行工具；`_detect_drift` 缺失 snapshot / 零基线 / 阈值内 边界；`_summary_of` 找不到实体返回 None。
+- **Alembic 迁移 `49d2e70677ed_phase3_2_approval_expiry_snapshot`**：新增两列（均 nullable），既有会话零影响。
+
+### Changed（变更）
+
+- **`AgentLoop.approve()`**：批准分支从"直接执行工具"扩展为"过期校验 → 漂移校验 → 执行"。过期或漂移一律 REJECT 原步骤、附观察、把 `(tool, entity_id)` 记入 `session.context["rejected"]`、`session.status = running`，交回 `_run()` 重新规划 —— 不启用超时自动执行，任何真实资金动作都必须经过新一轮提案。
+- **`AgentSessionStore.persist/_row_to_session`**：透传 `expires_at`（ISO → naive UTC datetime）与 `snapshot_json`，跨进程 / 单例 reset 后仍可还原审批上下文。
+- **`tests/test_migration.py`**：`_HEAD_REVISION = "49d2e70677ed"`（表数量未变，仅列增加）。
+
+### Rationale（设计原因）
+
+- 漂移阈值默认 20% 是"人工审批期间 ROI/spend 常见波动"和"不必要 abort 太频繁"的折中；生产可通过 `agent_approval_drift_pct` 调紧。字段选择限于 `current_summary()` 已经返回的四项 —— 覆盖 90% 的漂移场景（预算被手动改、campaign 被别的运营暂停、ROI 骤跌），账户级信号（预算余额、封户）留到 3.3 引入 `read_state()` 时再统一。
+- 快照在**提案时**冻结而不在**审批时**读：审批人看到的预测影响、审批理由是基于提案时刻的世界模型；用同一时刻的快照做对账，语义才自洽。
+- API 层 409 fail-fast + Loop 层同样再校验一次：API 快返回避免 UI 卡顿；Loop 兜底防御异步竞态（两个终端同时点批准、缓存与 DB 不同步等）。
+- 过期后**不自动重跑**：Loop 只把状态回到 running，由下一次决策（LLM 或规则引擎）自行判断是否还有必要提同一动作；避免"人已经离开审批席"却系统自作主张续跑。
+
+### Validation（验证）
+
+- `python3 -m pytest tests/ -q`：88 项全部通过（78 → 88，新增 10 项 Phase 3.2 测试）。
+- `python3 -m alembic upgrade head`：真实 `smartua.db` 从 `2ba2dc778e26` 升级到 `49d2e70677ed` 成功；`test_migration.py` 中的空库 upgrade / stamp / data-preserved 场景均通过。
+- 无回归：既有 78 项测试（Connector / Session / Autonomy / Memory / Auth / Ticket / Action state machine / Migration）全部保持通过。
+
+### 已知遗留（进入 Phase 3.3）
+
+- **`unknown` 状态无对账机制**：`AgentActionDB` 状态机能表达 `dispatching → unknown → verified|failed`，但真正的对账要等 Phase 3.3 dispatcher + Connector 状态回读接口。
+- **写动作仍走同步老路径**：审批通过后 Loop 直接调用 tool handler（进而调用 Connector API），未经过 `AgentActionStore.mint_or_get + transition + outbox`。这是 3.1 就明确留给 3.3 的工作，Phase 3.2 不改变。
+- **策略版本未纳入冻结**：路线图 3.2 提到"策略版本"也应冻结，但当前 `StrategyStore` 是 JSON 单例、无版本号；等 Phase 5.3 策略数据库化后再补冻结字段。
+- **账户级信号未纳入漂移**：预算余额、封户状态尚未在 `current_summary()` 中暴露，也就不在漂移检测范围内。Phase 3.3 会通过 Connector 的 `read_state()` 补齐。
+
+---
+
+## 未发布 - 2026-07-21 — 生产升级 Phase 3.1 动作实体与状态机（幂等）
+
+### Added（新增）
+
+- **`AgentActionDB`**（`backend/app/models/agent_runtime.py`）：真实写动作的唯一实体。字段涵盖 session/step/app/user、tool/action/entity、platform/account/execution_mode/risk_level、`request_json` + `request_digest`、`pre_state_json`、`predicted_impact_json`、`provider_request_id` + `provider_response_json`、`error`，以及四段时间戳（approved/dispatched/accepted/verified）。`idempotency_key` UNIQUE；`(app_id, state)` 复合索引。
+- **`AgentActionStore`**（`backend/app/services/agent_runtime/action_store.py`）：`mint_or_get()` 以 `(session_id, step_id, tool, params_digest)` 派生幂等键落库，DB UNIQUE 触发 IntegrityError 时回退 SELECT，返回同一动作实例。`transition()` 走白名单状态机 `proposed → approved → dispatching → accepted → verified | failed | unknown`，非法跳转抛 `InvalidTransition`。终态 `verified` / `failed` 不再迁移。
+- **`ActionRequest` dataclass**：显式冻结一次真实写动作的入参与目标快照，避免不同调用点手拼字段导致幂等键不稳定。
+- **Alembic 迁移 `2ba2dc778e26_phase3_1_agent_actions`**：新增 `agent_actions` 表 + 10 个索引；空库 `alembic upgrade head` / 现有库 stamp 后 upgrade 均通过。
+- **`tests/test_action_state_machine.py`**：10 项测试 —— 幂等键顺序无关、`mint_or_get` 复用同一记录、不同参数分裂两条、happy path 时间戳填充、跳阶段拒绝、终态回滚拒绝、`unknown` 收敛为 verified/failed、proposed→failed / dispatching→failed、`get` / `get_by_idempotency_key` 一致。
+
+### Changed（变更）
+
+- **`tests/test_migration.py`**：`_KNOWN_TABLES` 34 张 + `_HEAD_REVISION = 2ba2dc778e26`；`stamp` / `current` 断言同步升级到最新迁移。
+- **审计链保留**：`intent_execution_id` / `action_log_id` 作为软链接进入 `AgentActionDB`，不改变现有 `IntentExecution` / `ActionLog` 落库路径。Phase 3.3 会通过 `store.transition(..., intent_execution_id=..., action_log_id=...)` 把两侧对齐。
+
+### Rationale（设计原因）
+
+- 幂等键放在 (session_id, step_id, tool, params_digest) 这一层，而不是纯 params_digest：同一 tool 可能在不同审批 step 里合法出现两次（例如两次预算调整）。step_id 参与派生 → 同一审批 step 内的重复审批点击/网络重试 = 同一动作，不重复调用媒体；跨 step 的合法重复调用 = 不同动作。
+- `unknown` 是显式独立态而非"审批中/失败中的默认值"：媒体已 dispatch 但响应超时时，把动作停在 `unknown`，让 Phase 3.3 dispatcher 通过 Connector 的状态回读接口收敛，不用盲目重试或标记失败。
+- SQLite 上没有 CHECK 约束：应用层白名单先行；迁 PostgreSQL 时（Phase 5.1）再补数据库层护栏。
+
+### Validation（验证）
+
+- `python3 -m pytest tests/ -q`：78 项全部通过（60 项授权 + 8 项 ticket + 10 项 action state machine，含 `test_migration` 修订）。
+- `alembic upgrade head`（真实 `smartua.db` + 临时空库）：均成功；`alembic check` 无残差。
+- `python3 scripts/smoke_phaseA.py`（未变更）：A1/A2/A3 全部通过。
+
+### 已知遗留（进入 Phase 3.2 / 3.3）
+
+- **`_write()` 尚未接入状态机**：本步骤只建立实体与状态机契约。真实写动作目前仍是"审批通过 → 直接调用媒体 API → 补 IntentExecution/ActionLog"的老路径；把 outbox / dispatcher 接进 Loop 是 Phase 3.3 的任务。
+- **审批漂移未防护**：审批等待期间账户预算/状态发生变化，仍会用旧参数执行。Phase 3.2 会引入提案冻结、`expires_at`、执行前重校验。
+- **对账缺口**：`unknown` 状态目前只能靠人工干预；Phase 3.3 dispatcher + Connector 状态回读会自动收敛。
+- **多副本竞争**：`AgentActionStore` 依赖 DB UNIQUE 兜底幂等键，理论上多副本安全；但内存单例状态（如 SessionStore）尚未做多副本一致性，Phase 5.1 迁 PostgreSQL 后再统一处理。
+
+---
+
+## 未发布 - 2026-07-21 — 生产升级 Phase 2.2 SSE 一次性票据认证
+
+### Added（新增）
+
+- **`app/core/stream_ticket.py`**：新增 `StreamTicketStore`，签发短期（默认 60s）、单次消费、绑定 `(user_id, session_id)` 的 SSE 票据；`mint()` / `consume()` 都做 session 校验，跨 session 一律拒绝。
+- **`POST /agent/sessions/{id}/stream-ticket`**：JWT 认证 + `_require_session_access` → 返回 `{ticket, ttl_seconds}`；跨 app / 不存在 / 无权访问统一 404。
+- **`settings.agent_sse_ticket_ttl_seconds`**（默认 60）与 **`settings.agent_sse_allow_legacy_token`**（默认 False）：前者控制票据生存期，后者是"允许旧版 `?token=<长期 JWT>`"的灰度回滚开关；生产环境保持关闭。
+- **`tests/test_stream_ticket.py`**：8 项单元测试覆盖 mint、单次消费、跨 session 拒绝、过期、空 ticket、未知 ticket、单例、clear。
+- **前端 `agentAPI.createStreamTicket`**：`AgentConsole.jsx` 打开 SSE 前先向后端换 ticket，`?ticket=<一次性>` 取代 `?token=<长期 JWT>`。
+
+### Changed（变更）
+
+- **SSE 认证优先级重排**：`ticket`（推荐）→ `Authorization: Bearer <JWT>`（CLI/后端 client）→ 旧版 `?token=<长期 JWT>`（默认拒绝）。
+- **SSE 响应头新增 `Referrer-Policy: no-referrer`**：即便 ticket 短暂进入 URL，也不会通过 Referer 泄漏到跨域链接。
+- **前端 SSE 打开时序**：从"同步拼 URL"改为"先 await ticket 再开 EventSource"；组件卸载时正确 cancel 未完成的 mint。
+
+### Security Notes（安全说明）
+
+- 修复的是 CWE-598 Information Exposure Through Query Strings（长期 JWT 出现在 URL / 代理日志 / 浏览器历史）。原实现让 SmartUA 的所有历史 SSE 请求日志（nginx、CDN、APM、浏览器历史）都记录了完整长期 JWT，等价于全时段凭证泄漏。
+- 一次性 ticket 泄露的攻击面只有"一次订阅、60 秒内、绑定的 session"，且消费后立即失效；即便攻击者截获 ticket，也无法拼装出登录凭证。
+- Ticket 存储放在进程内单例是刻意选择——票据本就短命且不能跨副本共享，塞进 SQLite / Redis 反而引入不必要的耦合。Phase 5 durable runtime 完成后再评估。
+- 与 Phase 2.1 IDOR 修复配合：ticket 绑定 session_id，即便攻击者拿到别人的 ticket，也不能拿它订阅自己的 session（session 错配一律 401，且已 pop 单次消费）。
+
+### Validation（验证）
+
+- `python3 -m pytest tests/ -q`：68 项全部通过（原 60 项 + 新增 8 项 ticket 断言）。
+- `python3 scripts/smoke_phaseA.py`：A1/A2/A3 全部通过。
+- `npx vite build`：前端构建成功（2457 KB，gzip 791 KB），无 JSX 报错。
+
+### 已知遗留（进入 Phase 3.1）
+
+- Ticket 是进程内单例：多副本部署时每副本自建票据（前端 mint 与 open 都会打到同一副本）；Phase 5 durable runtime 后再评估是否迁到 Redis。
+- 灰度期若 `agent_sse_allow_legacy_token=True`，长期 JWT 仍可能进入 URL；仅在切换期短暂启用。
+- 认证 401 与 session 授权 404 目前对前端表现不同（401 会触发 login 跳转）；如未来 ticket 到期发生频繁 401，前端可考虑"自动 mint 一次再重连"的重试策略。
+
+---
+
+## 未发布 - 2026-07-21 — 生产升级 Phase 2.1 对象级授权（IDOR 修复）
+
+### Added（新增）
+
+- **`app/core/security.py` 授权工具**：新增 `user_can_access_app(user, app_id, db)` 与 `require_app_access(user, app_id, db)`，以现有 `UserAppBinding` 为唯一租户边界；不存在 / 无权访问统一抛 404，防止通过响应差异枚举 `app_id`。
+- **`_require_session_access(session, user, db)`**（`app/api/v1/agent.py`）：把"session 不存在"与"跨 app 无权访问"折叠成同一 404 响应，避免侧信道。
+- **`tests/test_auth_object_access.py`**：4 项测试覆盖 `user_can_access_app` 布尔矩阵、`require_app_access` 跨 app 404、`_require_session_access` 跨 app session 404、None session 404；`_bootstrap_users_and_apps` 幂等（conftest 的 fixture 只清 agent 表）。
+
+### Fixed（修复）
+
+- **`agent.py::get_session` 恒真 bug**：原 `if not session or session.app_id != session.app_id` 恒为 False，等于形同虚设的护栏。任何登录用户只要拿到别人 app 的 `session_id`，就能读到完整会话（步骤 / 审批 / provenance 等）。改为 `_require_session_access(session, current_user, db)` 严格校验。
+- **SSE 长通道跨 app 访问**：`GET /agent/sessions/{id}/stream` 之前只校验 token 合法，不校验 session 归属；改为 `_authenticate` 返回 User 后立即调用 `_require_session_access`，未授权用户即便截获别人的 `session_id + token` 也拿不到流。
+
+### Changed（变更）
+
+- **所有以 session_id 为路径参数的写端点强制授权**：`approve` / `message` / `abort` / `redirect` / `reflect` 五个端点都改为 `_require_session_access`；跨 app 用户全部 404。
+- **`autonomy_alerts` / `autonomy_scan` 强制 `require_app_access`**：query 参数 `app_id` 不再是纯 hint，跨 app 请求直接 404，绝不误报别人的告警。
+- **`POST /agent/sessions` 校验 req.app_id**：创建会话前先 `require_app_access(current_user, req.app_id, db)`；无权限用户无法把自己的会话挂到别人的 app 上。
+- **`GET /agent/sessions?app_id=...` 校验**：list 端点新增 `require_app_access`；跨 app 查询直接 404，不再暴露别人的会话列表。
+- **403 vs 404 语义收敛**：所有 agent 授权失败与"资源不存在"返回同样的 404 body，攻击者无法通过响应差异区分。
+
+### Validation（验证）
+
+- `python3 -m pytest tests/ -q`：60 项全部通过（原 56 项 + 新增 4 项授权断言）。
+- `python3 scripts/smoke_phaseA.py`：A1/A2/A3 全部通过。
+- 保留原有 provenance / 执行模式 / 幂等回读测试，未引入回归。
+
+### Security Notes（安全说明）
+
+- 修复的是 CWE-639 Insecure Direct Object Reference（IDOR），在多租户环境下属于必须堵住的高危漏洞。原恒真判断意味着 v1.8 之前所有历史版本都存在此洞。
+- 系统主动生成的会话仍使用 `SYSTEM_USER_ID = -1` 作占位，但审批端点会用真实登录用户的 `UserAppBinding` 校验 `session.app_id`，系统会话不再是绕过点。
+- 未在此步引入独立 `403`；后续如引入 tenant 层次或角色细分权限（如"只能审批 L1，不能审批 L2"），会显式区分授权失败原因。
+
+### 已知遗留（进入 Phase 2.2）
+
+- SSE 仍支持 `?token=<长期 JWT>` 兼容路径：JWT 会进入 URL、代理日志、浏览器历史；Phase 2.2 将改为 stream-ticket（短期、单次、绑定 session/user）。
+- Strategy 端点 `/agent/strategy` 目前仍是全局单例，不带 app 维度，跨 app 之间共享策略数据。Phase 5.3 会把 Strategy 按 app/channel/country/version 分表并做作用域授权。
+
+---
+
 ## 未发布 - 2026-07-21 — 生产升级 Phase 1.2 执行模式在 API / SSE / 前端全链路显示
 
 ### Added（新增）

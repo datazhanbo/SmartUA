@@ -664,6 +664,32 @@ class BaseConnector(ABC):
         """媒体账户状态；默认 ok。子类（如 MockMediaConnector）可覆盖以反映封户/受限。"""
         return "ok"
 
+    def read_state(self, entity_id: str) -> Optional[Dict[str, Any]]:
+        """Phase 3.3 —— 回读单个实体的最新状态，供 dispatcher 做 accepted → verified 对账。
+
+        默认实现从 `current_summary()` 匹配 `campaign_id == entity_id` 的行返回
+        `{status, daily_budget, roi, spend, cpi}`。真实 Connector（未来）应改为直接
+        调用媒体 API 的"取实体状态"接口；找不到返回 None，dispatcher 据此把动作停在
+        `unknown`（媒体也许已改动、但无法确认），等待人工/后续对账收敛。
+        """
+        if not entity_id:
+            return None
+        try:
+            rows = self.current_summary()
+        except Exception as e:
+            logger.warning("read_state via current_summary failed: %s", e)
+            return None
+        for r in rows or []:
+            if str(r.get("campaign_id")) == str(entity_id):
+                return {
+                    "status": r.get("status"),
+                    "daily_budget": r.get("daily_budget"),
+                    "roi": r.get("roi"),
+                    "spend": r.get("spend"),
+                    "cpi": r.get("cpi"),
+                }
+        return None
+
     def simulate_impact(self, action: str, entity_id: str, params: Dict, horizon: int = 7):
         """动作影响占位估计：无因果引擎时返回全 0（上层 loop 据此给出中性预测）。"""
         n = max(1, int(horizon))

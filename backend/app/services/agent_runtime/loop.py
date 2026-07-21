@@ -18,6 +18,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from app.config import settings
@@ -29,6 +30,75 @@ from app.services.agent_runtime.tools import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Phase 3.2：审批过期 / 状态漂移
+#
+# 提案冻结 (expires_at, snapshot)；审批通过后 Loop 会：
+#   1. 若 now > expires_at → 拒绝执行、给出观察、重新规划。
+#   2. 重新读取实体：roi / spend / daily_budget 相对快照的相对变化超过 drift_pct，
+#      或 status 从快照直接翻转 → 拒绝执行、给出漂移说明、重新规划。
+# 目的是避免"等待期间账户状态已变（预算调过、活动被暂停、ROI 塌方），审批却还照旧执行旧提案"。
+_DRIFT_KEYS_NUMERIC = ("roi", "spend", "daily_budget")
+
+
+def _iso_to_utc(s: Optional[str]) -> Optional[datetime]:
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _summary_of(ctx: AgentContext, entity_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    """取 connector.current_summary() 中匹配 entity_id 的那一行；缺失时返回 None。"""
+    if not entity_id:
+        return None
+    try:
+        rows = ctx.connector.current_summary()
+    except Exception:
+        return None
+    for r in rows or []:
+        if str(r.get("campaign_id")) == str(entity_id):
+            return {
+                "roi": r.get("roi"),
+                "spend": r.get("spend"),
+                "status": r.get("status"),
+                "daily_budget": r.get("daily_budget"),
+            }
+    return None
+
+
+def _detect_drift(snapshot: Optional[Dict[str, Any]],
+                  current: Optional[Dict[str, Any]],
+                  pct: float) -> Optional[str]:
+    """返回漂移原因（人类可读）；None 表示可继续执行。快照缺失时视为不漂移。"""
+    if not snapshot or not current:
+        return None
+    snap_status = snapshot.get("status")
+    cur_status = current.get("status")
+    if snap_status and cur_status and str(snap_status) != str(cur_status):
+        return f"status 从 {snap_status} 变为 {cur_status}"
+    for k in _DRIFT_KEYS_NUMERIC:
+        sv, cv = snapshot.get(k), current.get(k)
+        if sv is None or cv is None:
+            continue
+        try:
+            sv_f = float(sv); cv_f = float(cv)
+        except (TypeError, ValueError):
+            continue
+        if abs(sv_f) < 1e-9:
+            if abs(cv_f) > 1e-9:
+                return f"{k} 从 0 变为 {cv_f:.3g}"
+            continue
+        rel = abs(cv_f - sv_f) / abs(sv_f)
+        if rel > pct:
+            return f"{k} 从 {sv_f:.3g} 漂移至 {cv_f:.3g}（{rel*100:.1f}% > 阈值 {pct*100:.0f}%）"
+    return None
 
 
 @dataclass
@@ -65,13 +135,38 @@ class AgentLoop:
             raise ValueError("未找到待审批步骤")
         tool = self.registry.get(step.tool)
         if approved:
+            # Phase 3.2 —— 审批过期 / 状态漂移校验
+            entity_id = (step.params or {}).get("entity_id")
+            expired_dt = _iso_to_utc(step.expires_at)
+            now_dt = datetime.now(timezone.utc)
+            if expired_dt is not None and now_dt > expired_dt:
+                step.status = AgentStepStatus.REJECTED.value
+                step.text += f"（审批已过期：expires_at={step.expires_at}，超时废弃，将重新规划）"
+                session.add_step(AgentStep(
+                    kind=AgentStepKind.OBSERVATION.value,
+                    text=f"⏱ 审批过期，跳过执行 {tool.name if tool else step.tool}({entity_id})，需要重新观察后再提议。",
+                    status=AgentStepStatus.DONE.value))
+                session.context.setdefault("rejected", []).append((step.tool, entity_id))
+                session.status = "running"
+                return self._done(self._run(session, ctx))
+
+            current = _summary_of(ctx, entity_id)
+            drift = _detect_drift(step.snapshot, current, settings.agent_approval_drift_pct)
+            if drift:
+                step.status = AgentStepStatus.REJECTED.value
+                step.text += f"（状态漂移：{drift}，废弃旧提案，将重新规划）"
+                session.add_step(AgentStep(
+                    kind=AgentStepKind.OBSERVATION.value,
+                    text=f"⚠ 审批期间实体 {entity_id} 状态漂移：{drift}。跳过旧提案，重新观察后再决策。",
+                    status=AgentStepStatus.DONE.value,
+                    result={"snapshot": step.snapshot, "current": current}))
+                session.context.setdefault("rejected", []).append((step.tool, entity_id))
+                session.status = "running"
+                return self._done(self._run(session, ctx))
+
             step.status = AgentStepStatus.APPROVED.value
             if tool and tool.side_effect == "write":
-                res = tool.handler(step.params, ctx)
-                session.add_step(AgentStep(
-                    kind=AgentStepKind.ACTION.value, text=res.observation,
-                    tool=tool.name, params=step.params, risk_level=step.risk_level,
-                    status=AgentStepStatus.EXECUTED.value, result=res.data))
+                self._execute_approved_write(session, ctx, step, tool)
             session.status = "running"
             return self._done(self._run(session, ctx))
         else:
@@ -174,6 +269,135 @@ class AgentLoop:
             status=AgentStepStatus.DONE.value))
         session.status = "done"
 
+    def _execute_approved_write(self, session: AgentSession, ctx: AgentContext,
+                                 step: AgentStep, tool) -> None:
+        """审批通过后的写动作：走 dispatcher（幂等 + 状态机 + 回读验证）。
+
+        - `tool.handler` 仍然承担媒体调用 + 审计（IntentExecution/ActionLog）——
+          dispatcher 把它包成 media_call，避免破坏既有审计链。
+        - AgentActionDB 通过 `mint_or_get` 幂等生成，重复审批不会二次写媒体。
+        - 回读通过 `ctx.connector.read_state` 完成，命中 → verified，否则 → unknown。
+        """
+        outcome = self._dispatch_via_action_store(
+            session, ctx, tool=tool, params=step.params,
+            risk_level=step.risk_level or tool.risk_level,
+            step_id=step.id, snapshot=step.snapshot,
+            predicted_impact=step.predicted_impact,
+        )
+        session.add_step(AgentStep(
+            kind=AgentStepKind.ACTION.value, text=outcome["text"],
+            tool=tool.name, params=step.params, risk_level=step.risk_level,
+            status=outcome["status"], result=outcome["data"]))
+
+    def _execute_l0_write(self, session: AgentSession, ctx: AgentContext,
+                          tool, params: Dict[str, Any]) -> None:
+        """L0 写动作自动执行路径：同样落进 AgentActionDB 状态机。"""
+        outcome = self._dispatch_via_action_store(
+            session, ctx, tool=tool, params=params,
+            risk_level="L0", step_id=None, snapshot=None,
+            predicted_impact=self._predict(ctx, tool.name, params),
+        )
+        session.add_step(AgentStep(
+            kind=AgentStepKind.ACTION.value, text=outcome["text"], tool=tool.name,
+            params=params, risk_level="L0",
+            status=outcome["status"], result=outcome["data"]))
+
+    def _dispatch_via_action_store(self, session: AgentSession, ctx: AgentContext,
+                                    *, tool, params: Dict[str, Any], risk_level: str,
+                                    step_id: Optional[str],
+                                    snapshot: Optional[Dict[str, Any]],
+                                    predicted_impact: Optional[Dict[str, Any]]
+                                    ) -> Dict[str, Any]:
+        """把"审批通过/L0 自动"的写动作交给 Dispatcher 走状态机。
+
+        无 DB（demo）或缺失 action mapping 时回退到旧路径：直接 tool.handler，
+        便于不依赖数据库的脚本仍然可跑。
+        """
+        from app.services.agent_runtime.action_store import ActionRequest
+        from app.services.agent_runtime.dispatcher import get_dispatcher
+        from app.services.agent_runtime.tools import TOOL_TO_ACTION
+
+        # 无 DB 或工具不在动作映射：兜底走旧的直接执行（demo 场景）
+        if ctx.db is None or tool.name not in TOOL_TO_ACTION:
+            res = tool.handler(params, ctx)
+            return {"text": res.observation,
+                    "data": res.data,
+                    "status": AgentStepStatus.EXECUTED.value}
+
+        action_name, build_ap = TOOL_TO_ACTION[tool.name]
+        action_params = build_ap(params)
+        req = ActionRequest(
+            session_id=str(session.id),
+            step_id=str(step_id or "auto"),
+            app_id=ctx.app_id,
+            user_id=getattr(ctx.user, "id", None) if ctx.user else None,
+            tool=tool.name,
+            action=action_name,
+            entity_id=params.get("entity_id"),
+            platform=getattr(ctx.connector, "platform", None),
+            account_id=getattr(ctx.connector, "account_id", None) or None,
+            execution_mode=getattr(ctx.connector, "execution_mode", None),
+            risk_level=risk_level,
+            request={**action_params, "entity_id": params.get("entity_id")},
+            pre_state=snapshot,
+            predicted_impact=predicted_impact,
+        )
+
+        # media_call = tool.handler(...)：既完成媒体调用又完成 IntentExecution/ActionLog 审计
+        captured: Dict[str, Any] = {}
+
+        def media_call():
+            res = tool.handler(params, ctx)
+            captured["result"] = res
+            data = res.data or {}
+            provider = data.get("result") if isinstance(data.get("result"), dict) else data
+            return {"success": bool(res.ok),
+                    "provider": provider,
+                    "observation": res.observation}
+
+        read_state = getattr(ctx.connector, "read_state", None)
+        try:
+            outcome = get_dispatcher().dispatch_and_verify(
+                ctx.db, req, media_call=media_call, read_state=read_state)
+            try:
+                ctx.db.commit()
+            except Exception as e:
+                logger.warning("commit after dispatch failed: %s", e)
+                try:
+                    ctx.db.rollback()
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.exception("dispatch_via_action_store raised, falling back to direct handler")
+            res = tool.handler(params, ctx)
+            return {"text": f"{res.observation}（dispatcher 异常回退：{e}）",
+                    "data": res.data,
+                    "status": AgentStepStatus.EXECUTED.value}
+
+        # dispatcher 状态映射到 AgentStepStatus
+        state_status = {
+            "verified": AgentStepStatus.EXECUTED.value,
+            "failed": AgentStepStatus.EXECUTED.value,  # 已进入终态，仍算已执行
+            "unknown": AgentStepStatus.EXECUTED.value,
+        }.get(outcome.state, AgentStepStatus.EXECUTED.value)
+
+        res = captured.get("result")
+        if res is not None:
+            observation = f"{res.observation}｜派发状态：{outcome.state}（{outcome.observation}）"
+            data = {**(res.data or {}), "dispatch": {
+                "state": outcome.state,
+                "action_id": outcome.action.id,
+                "observation": outcome.observation,
+            }}
+        else:
+            observation = f"派发状态：{outcome.state}（{outcome.observation}）"
+            data = {"dispatch": {
+                "state": outcome.state,
+                "action_id": outcome.action.id,
+                "observation": outcome.observation,
+            }}
+        return {"text": observation, "data": data, "status": state_status}
+
     def _dispatch(self, session: AgentSession, ctx: AgentContext, decision: Decision):
         tool = self.registry.get(decision.action)
         if tool is None:
@@ -200,11 +424,7 @@ class AgentLoop:
 
         # 写工具
         if tool.risk_level == "L0":
-            res = tool.handler(decision.params, ctx)
-            session.add_step(AgentStep(
-                kind=AgentStepKind.ACTION.value, text=res.observation, tool=tool.name,
-                params=decision.params, risk_level="L0",
-                status=AgentStepStatus.EXECUTED.value, result=res.data))
+            self._execute_l0_write(session, ctx, tool, decision.params)
             return
 
         # L1/L2/L3 → 提议，转人在环
@@ -214,11 +434,16 @@ class AgentLoop:
             "execution_mode": getattr(ctx.connector, "execution_mode", None),
             "account_id": getattr(ctx.connector, "account_id", None) or None,
         }
+        # Phase 3.2：冻结实体快照 + 审批过期时间
+        snapshot = _summary_of(ctx, decision.params.get("entity_id"))
+        expires_at = (datetime.now(timezone.utc)
+                      + timedelta(seconds=settings.agent_approval_ttl_seconds)).isoformat()
         session.add_step(AgentStep(
             kind=AgentStepKind.APPROVAL.value,
             text=f"提议{tool.name}：{_propose_text(tool, decision.params)}",
             tool=tool.name, params=decision.params, risk_level=tool.risk_level,
             predicted_impact=pred, status=AgentStepStatus.PROPOSED.value,
+            expires_at=expires_at, snapshot=snapshot,
             result={"provenance": provenance}))
         session.status = "awaiting_approval"
 

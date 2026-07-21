@@ -73,3 +73,27 @@ def get_user_apps(user: User, db: Session) -> List[dict]:
         {"id": b.app_id, "role_id": b.role_id, "is_default": b.is_default}
         for b in bindings
     ]
+
+
+def user_can_access_app(user: User, app_id: int, db: Session) -> bool:
+    """Phase 2.1：用户对某 app 是否有访问权限（基于 UserAppBinding）。
+
+    单一来源判断，供 Agent / 自治 / 策略等所有以 app_id 为租户边界的端点复用。
+    system-generated 会话（user_id 为负数占位）不视为归属，不由此函数管辖。
+    """
+    if user is None or app_id is None:
+        return False
+    return db.query(UserAppBinding).filter(
+        UserAppBinding.user_id == user.id,
+        UserAppBinding.app_id == app_id,
+    ).first() is not None
+
+
+def require_app_access(user: User, app_id: int, db: Session) -> None:
+    """Phase 2.1：断言用户对 app 有权限；否则抛 404（避免对象枚举）。
+
+    统一返回 404 是刻意选择：与其暴露 "app 存在但你没权限" 的 403，不如让攻击者
+    无法从响应中区分 "不存在" 与 "存在但拒绝"，堵住枚举侧信道。
+    """
+    if not user_can_access_app(user, app_id, db):
+        raise HTTPException(status_code=404, detail="Not found")

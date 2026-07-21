@@ -72,6 +72,8 @@ export const agentAPI = {
   abortSession: (id) => api.post(`/agent/sessions/${id}/abort`),
   // 中途改向：中断当前 Loop 并按新指令重启一轮 ReAct
   redirectSession: (id, text) => api.post(`/agent/sessions/${id}/redirect`, { text }),
+  // Phase 2.2：签发一次性 SSE 票据（短期、单次、绑定当前用户 + session）
+  createStreamTicket: (id) => api.post(`/agent/sessions/${id}/stream-ticket`),
   // 全局复盘（基于沉淀的 Episode 记忆）
   reflect: () => api.post('/agent/reflect'),
   // 按会话复盘

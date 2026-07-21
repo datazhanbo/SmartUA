@@ -85,6 +85,20 @@ class Settings(BaseSettings):
     # 主动监控的 app 列表（演示期仅 app_id=1）
     agent_monitor_app_ids: List[int] = [1]
 
+    # ===== Phase 3.2 审批过期与执行前重校验 =====
+    # 提案冻结的审批时效（秒）；超时后审批 API 返回 409，Loop 不再执行该动作。
+    agent_approval_ttl_seconds: int = 900
+    # 状态漂移阈值（相对变化）：审批通过后重新读取实体，若关键指标（roi/spend/daily_budget）
+    # 相对提案快照的相对变化超过此比例，或 status 直接变化，则废弃旧动作、重新规划。
+    agent_approval_drift_pct: float = 0.20
+
+    # ===== Phase 2.2 SSE 认证 =====
+    # SSE stream-ticket 生存期（秒）：短期 + 单次 + 绑定 (user, session)。
+    agent_sse_ticket_ttl_seconds: int = 60
+    # 兼容开关：是否允许旧的 ?token=<长期 JWT> 打开 SSE。默认 False，将长期 JWT
+    # 从 URL / 代理日志 / 浏览器历史移除；仅在需要向前兼容旧前端时短期开启。
+    agent_sse_allow_legacy_token: bool = False
+
     class Config:
         env_file = ".env"
 

@@ -8,7 +8,8 @@ from sqlalchemy.orm import sessionmaker
 # Migration tests use real file-based SQLite databases (alembic needs a file).
 # They do not import from conftest.py to avoid the in-memory override.
 
-_KNOWN_TABLES = 33  # Baseline migration creates 33 tables
+_KNOWN_TABLES = 34  # Baseline (33) + phase3.1 agent_actions
+_HEAD_REVISION = "49d2e70677ed"  # phase3.2 approval expiry + snapshot
 
 
 @pytest.fixture
@@ -55,7 +56,7 @@ def test_empty_db_upgrade_head(tmp_db):
 
     with engine.connect() as conn:
         row = conn.execute(text("SELECT version_num FROM alembic_version")).scalar()
-    assert row == "76c3bd1f529f", f"Expected head revision 76c3bd1f529f, got {row}"
+    assert row == _HEAD_REVISION, f"Expected head revision {_HEAD_REVISION}, got {row}"
     engine.dispose()
 
 
@@ -69,11 +70,11 @@ def test_alembic_current_shows_head(tmp_db):
     """alembic current should show the head revision."""
     _run_alembic_on(tmp_db, "upgrade head")
     result = _run_alembic_on(tmp_db, "current")
-    assert "76c3bd1f529f" in result.stdout, f"Expected 76c3bd1f529f in current, got: {result.stdout}"
+    assert _HEAD_REVISION in result.stdout, f"Expected {_HEAD_REVISION} in current, got: {result.stdout}"
 
 
 def test_existing_db_stamp_and_upgrade(tmp_db):
-    """Simulate an existing DB (v1.8 pre-migration) with create_all then stamp + upgrade."""
+    """Simulate an existing DB with create_all then stamp + upgrade."""
     # 1. Create tables via create_all (simulating a pre-migration DB)
     from app.config import settings as app_settings
     from app.db.base import Base
@@ -86,14 +87,14 @@ def test_existing_db_stamp_and_upgrade(tmp_db):
     engine.dispose()
 
     # 2. Stamp to head
-    _run_alembic_on(tmp_db, "stamp 76c3bd1f529f")
+    _run_alembic_on(tmp_db, f"stamp {_HEAD_REVISION}")
 
     engine = create_engine(f"sqlite:///{tmp_db}")
     inspector = inspect(engine)
     assert "alembic_version" in inspector.get_table_names()
     with engine.connect() as conn:
         row = conn.execute(text("SELECT version_num FROM alembic_version")).scalar()
-    assert row == "76c3bd1f529f", f"Expected head revision, got {row}"
+    assert row == _HEAD_REVISION, f"Expected head revision, got {row}"
     engine.dispose()
 
 
@@ -113,7 +114,7 @@ def test_existing_db_data_preserved(tmp_db):
     db.close()
     engine.dispose()
 
-    _run_alembic_on(tmp_db, "stamp 76c3bd1f529f")
+    _run_alembic_on(tmp_db, f"stamp {_HEAD_REVISION}")
 
     engine = create_engine(f"sqlite:///{tmp_db}")
     with engine.connect() as conn:

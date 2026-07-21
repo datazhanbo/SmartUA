@@ -55,6 +55,9 @@ class AgentStep(BaseModel):
     status: str = "done"
     result: Optional[Dict[str, Any]] = None
     created_at: str = Field(default_factory=_now)
+    # Phase 3.2 审批过期 / 漂移校验（仅审批类步骤使用；ISO 字符串）
+    expires_at: Optional[str] = None
+    snapshot: Optional[Dict[str, Any]] = None
 
     def short(self) -> str:
         tag = {
@@ -137,6 +140,8 @@ class AgentSessionStore:
                 status=sr.status or "done",
                 result=sr.result_json,
                 created_at=sr.created_at.isoformat() if sr.created_at else _now(),
+                expires_at=sr.expires_at.isoformat() if sr.expires_at else None,
+                snapshot=sr.snapshot_json,
             ))
         raw_ctx = dict(row.context_json or {})
         prov = raw_ctx.pop(cls._PROV_KEY, None) or {}
@@ -182,6 +187,14 @@ class AgentSessionStore:
             # 重建步骤（先删后插，保证顺序与当前内存一致）
             db.query(AgentStepDB).filter(AgentStepDB.session_id == session.id).delete()
             for seq, st in enumerate(session.steps, start=1):
+                exp_dt: Optional[datetime] = None
+                if st.expires_at:
+                    try:
+                        exp_dt = datetime.fromisoformat(st.expires_at.replace("Z", "+00:00"))
+                        if exp_dt.tzinfo is not None:
+                            exp_dt = exp_dt.astimezone(timezone.utc).replace(tzinfo=None)
+                    except Exception:
+                        exp_dt = None
                 db.add(AgentStepDB(
                     id=st.id,
                     session_id=session.id,
@@ -194,6 +207,8 @@ class AgentSessionStore:
                     predicted_impact_json=st.predicted_impact,
                     status=st.status,
                     result_json=st.result,
+                    expires_at=exp_dt,
+                    snapshot_json=st.snapshot,
                 ))
             db.commit()
         finally:

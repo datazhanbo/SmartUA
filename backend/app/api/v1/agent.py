@@ -19,7 +19,8 @@ from typing import Optional, List
 from sqlalchemy.orm import Session
 
 from app.db.base import get_db, SessionLocal
-from app.core.security import get_current_user, decode_token
+from app.core.security import get_current_user, decode_token, require_app_access, user_can_access_app
+from app.core.stream_ticket import get_stream_ticket_store
 from app.models.sys import User
 from app.config import settings
 from app.services.agent_runtime import (
@@ -35,6 +36,16 @@ from app.services.agent_runtime.session import (
 )
 
 router = APIRouter(prefix="/agent", tags=["agent"])
+
+
+def _require_session_access(session, user: User, db: Session):
+    """Phase 2.1：断言用户可访问该 session（其 app 在用户 UserAppBinding 里）。
+
+    session 不存在 与 无权访问 都返回 404，避免通过响应差异枚举 session_id。
+    调用方无需自行判空。
+    """
+    if session is None or not user_can_access_app(user, session.app_id, db):
+        raise HTTPException(status_code=404, detail="Session not found")
 
 
 # ----------------------------- Schemas ----------------------------- #
@@ -137,10 +148,17 @@ def _sse(event: str, data: dict) -> str:
 
 
 def _authenticate(token: Optional[str], authorization: Optional[str], db: Session) -> User:
-    """SSE 鉴权：token 可来自 query（EventSource 无法自定义 Header）或 Authorization Header。"""
-    raw = token
-    if not raw and authorization:
+    """SSE 鉴权：Authorization Header（Bearer JWT）优先；`?token=` 长期 JWT 默认拒绝。
+
+    Phase 2.2：长期 JWT 不再进入 URL / 代理日志 / 浏览器历史。前端使用一次性
+    stream-ticket；本函数只处理 Authorization Header 或（旧版兼容时）query token。
+    stream-ticket 由 stream_session 单独处理，因其携带 session 绑定信息。
+    """
+    raw = None
+    if authorization:
         raw = authorization[7:] if authorization.startswith("Bearer ") else authorization
+    if not raw and token and settings.agent_sse_allow_legacy_token:
+        raw = token
     if not raw:
         raise HTTPException(status_code=401, detail="未提供认证凭据")
     payload = decode_token(raw)
@@ -160,6 +178,7 @@ def create_session(
     db: Session = Depends(get_db),
 ):
     """创建 Agent 会话并异步启动 ReAct 循环（立即返回，进度由前端轮询）。"""
+    require_app_access(current_user, req.app_id, db)
     store = get_session_store()
     try:
         prov = _resolve_session_provenance(db, req.app_id)
@@ -182,6 +201,7 @@ def list_sessions(
     db: Session = Depends(get_db),
 ):
     """列出本 app 的 Agent 会话。"""
+    require_app_access(current_user, app_id, db)
     store = get_session_store()
     return store.list(app_id)
 
@@ -195,15 +215,34 @@ def get_session(
     """查看会话状态。"""
     store = get_session_store()
     session = store.get(session_id)
-    if not session or session.app_id != session.app_id:
-        raise HTTPException(status_code=404, detail="Session not found")
+    _require_session_access(session, current_user, db)
     return session
+
+
+@router.post("/sessions/{session_id}/stream-ticket")
+def create_stream_ticket(
+    session_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """签发一次性 SSE 票据：JWT 认证 + session 归属校验 → 短期、单次、绑定 (user, session)。
+
+    Phase 2.2：把长期 JWT 从 URL / 代理日志 / 浏览器历史里彻底移出。前端拿到 ticket 后
+    只在 `GET /agent/sessions/{id}/stream?ticket=...` 这一次订阅时使用；消费后立即失效。
+    session 不存在 / 无权访问统一 404，避免通过响应差异枚举 session_id。
+    """
+    store = get_session_store()
+    session = store.get(session_id)
+    _require_session_access(session, current_user, db)
+    ticket, ttl = get_stream_ticket_store().mint(current_user.id, session_id)
+    return {"ticket": ticket, "ttl_seconds": ttl}
 
 
 @router.get("/sessions/{session_id}/stream")
 async def stream_session(
     session_id: str,
-    token: Optional[str] = Query(None, description="SSE 鉴权 token（EventSource 无法自定义 Header，故走 query）"),
+    ticket: Optional[str] = Query(None, description="Phase 2.2 一次性票据（推荐）"),
+    token: Optional[str] = Query(None, description="旧版长期 JWT（默认拒绝，需开启 agent_sse_allow_legacy_token）"),
     authorization: Optional[str] = Header(None),
     db: Session = Depends(get_db),
 ):
@@ -211,12 +250,29 @@ async def stream_session(
 
     前端用 EventSource 订阅，实现"边跑边显示"的实时明细流（thought/observation/action/approval/final），
     避免整轮 Agent Loop（真调大模型需数分钟）跑完才一次性返回。
+
+    认证优先级（Phase 2.2）：
+    1) 一次性 ticket（推荐）：`?ticket=` — 短期、单次、绑定 (user, session)。
+    2) Authorization Header（Bearer JWT）— 命令行/后端 client 调试用。
+    3) 旧版 `?token=<长期 JWT>` — 默认拒绝；仅在 `agent_sse_allow_legacy_token=True`
+       开启时可用，目的是让灰度期能滚回旧前端。
     """
-    _authenticate(token, authorization, db)
+    user: Optional[User] = None
     store = get_session_store()
+
+    if ticket:
+        # 票据消费失败（不存在 / 过期 / 已用 / session 错配）全部同一 401，避免枚举 session_id
+        uid = get_stream_ticket_store().consume(ticket, session_id)
+        if uid is None:
+            raise HTTPException(status_code=401, detail="Invalid or expired stream ticket")
+        user = db.query(User).filter(User.id == uid).first()
+        if user is None:
+            raise HTTPException(status_code=401, detail="Invalid or expired stream ticket")
+    else:
+        user = _authenticate(token, authorization, db)
+
     session = store.get(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
+    _require_session_access(session, user, db)
 
     async def event_gen():
         last = 0
@@ -274,6 +330,7 @@ async def stream_session(
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",  # 关闭下游代理缓冲（如 nginx）
+            "Referrer-Policy": "no-referrer",  # Phase 2.2：即便 ticket 泄进 URL，也不通过 Referer 外发
         },
     )
 
@@ -288,8 +345,31 @@ def approve_step(
     """人在环审批一个待确认动作；批准后 Agent 异步续跑，驳回后重新规划（立即返回）。"""
     store = get_session_store()
     session = store.get(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
+    _require_session_access(session, current_user, db)
+
+    # Phase 3.2 —— 审批过期 fail-fast（批准前即可判定；驳回不受此限制，仍允许说明原因）
+    if req.approved:
+        step = next((s for s in session.steps if s.id == req.step_id), None)
+        if step is None or step.kind != AgentStepKind.APPROVAL.value:
+            raise HTTPException(status_code=404, detail="Approval step not found")
+        if step.status != AgentStepStatus.PROPOSED.value:
+            raise HTTPException(status_code=409,
+                                detail=f"Approval step no longer proposed (status={step.status})")
+        if step.expires_at:
+            from datetime import datetime as _dt, timezone as _tz
+            try:
+                exp = _dt.fromisoformat(step.expires_at.replace("Z", "+00:00"))
+                if exp.tzinfo is None:
+                    exp = exp.replace(tzinfo=_tz.utc)
+                if _dt.now(_tz.utc) > exp:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={"error": "approval_expired", "expires_at": step.expires_at,
+                                "message": "提案已过期，请重新触发规划"})
+            except HTTPException:
+                raise
+            except Exception:
+                pass
 
     # 若是主动自治生成的提案，回写关联告警状态（前端告警流随之更新）
     try:
@@ -315,8 +395,7 @@ def send_message(
     """向 Agent 追加指令 / 多轮追问（异步执行，立即返回）。"""
     store = get_session_store()
     session = store.get(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
+    _require_session_access(session, current_user, db)
 
     session.status = "running"  # 立即返回 running，驱动前端轮询
     _spawn_loop("message", session, current_user, session.app_id, text=req.text)
@@ -332,8 +411,7 @@ def abort_session(
     """中断当前运行中的 Loop（优雅停机，保留已完成步骤）。"""
     store = get_session_store()
     session = store.get(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
+    _require_session_access(session, current_user, db)
     session.abort_requested = True
     store.persist(session)
     return {"ok": True, "status": session.status}
@@ -353,8 +431,7 @@ def redirect_session(
     """
     store = get_session_store()
     session = store.get(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
+    _require_session_access(session, current_user, db)
     if session.status != "running":
         raise HTTPException(status_code=400, detail="仅运行中的会话可改向")
     session.abort_requested = True
@@ -387,8 +464,7 @@ def reflect_session(
         raise HTTPException(status_code=503, detail="反思功能未启用（agent_reflection_enabled=false）")
     store = get_session_store()
     session = store.get(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
+    _require_session_access(session, current_user, db)
     result = Reflector().reflect(get_memory(), goal=session.goal)
     return result.to_dict()
 
@@ -457,8 +533,10 @@ def autonomy_status(
 def autonomy_alerts(
     app_id: int = 1,
     current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
     """列出本 app 的主动自治告警（含待审批提案，可一键批准）。"""
+    require_app_access(current_user, app_id, db)
     alerts = get_autonomy_store().list_alerts(app_id)
     # 最新的在前
     return [a.to_dict() for a in reversed(alerts)]
@@ -471,6 +549,7 @@ def autonomy_scan(
     db: Session = Depends(get_db),
 ):
     """手动触发一次主动巡检（等价于调度器的一次执行，便于演示/测试）。"""
+    require_app_access(current_user, app_id, db)
     alerts = AutonomyEngine().scan(app_id=app_id, db=db, user=current_user)
     return {
         "scanned": True,

@@ -25,9 +25,9 @@
 | Phase | 名称 | 状态 | 当前步骤 |
 |-------|------|------|---------|
 | 0 | 基线与迁移地基 | 进行中 | 0.1 ✅ → 0.2 ✅ |
-| 1 | 真实与模拟严格隔离 | 进行中 | 1.1 ✅ · 1.2 ✅ → 2.1 |
-| 2 | 对象授权与会话安全 | 待开始 | — |
-| 3 | 安全动作闭环 | 待开始 | — |
+| 1 | 真实与模拟严格隔离 | ✅ 已完成 | 1.1 ✅ · 1.2 ✅ |
+| 2 | 对象授权与会话安全 | ✅ 已完成 | 2.1 ✅ · 2.2 ✅ |
+| 3 | 安全动作闭环 | 进行中 | 3.1 ✅ · 3.2 ✅ · 3.3 ✅ |
 | 4 | 真实影响与学习质量 | 待开始 | — |
 | 5 | 持久运行时与多实例协调 | 待开始 | — |
 | 6 | 有限扩充只读能力 | 待开始 | — |
@@ -175,7 +175,18 @@
 
 **验收：** 跨 App 用户对 session/approval/abort/redirect/alert/strategy 请求全部 404；同 App 授权用户正常。
 
-**状态：** ⬜ 待开始 | **依赖：** 0.1 | **下一步：** 修复 agent.py 中 app_id 比对 bug
+**状态：** ✅ 已完成（2026-07-21） | **依赖：** 0.1 | **下一步：** 2.2 修复 SSE 认证
+
+**验证结果：**
+- `app/core/security.py` 新增 `user_can_access_app(user, app_id, db)` 与 `require_app_access(user, app_id, db)`；不存在 / 无权访问统一抛 404（避免通过响应差异枚举 app_id）。
+- `app/api/v1/agent.py` 新增 `_require_session_access(session, user, db)`；同样把"session 不存在"与"跨 app 无权"折叠成 404。
+- 修复 `agent.py` 中 `session.app_id != session.app_id`（恒为 False，等于形同虚设的护栏）；统一改为 `_require_session_access`。
+- 授权拦截接入以下端点：`POST /agent/sessions`（req.app_id）、`GET /agent/sessions`（list app_id）、`GET /agent/sessions/{id}`、`GET /agent/sessions/{id}/stream`（SSE 也走 session 授权）、`POST /agent/sessions/{id}/approve`、`POST /agent/sessions/{id}/message`、`POST /agent/sessions/{id}/abort`、`POST /agent/sessions/{id}/redirect`、`POST /agent/sessions/{id}/reflect`、`GET /agent/autonomy/alerts`、`POST /agent/autonomy/scan`。
+- SSE `_authenticate` 现返回 User，直接串到 `_require_session_access`；未授权用户即便截获别人的 `session_id + token` 也拿不到流。
+- 系统自治会话使用 `SYSTEM_USER_ID = -1` 保持不变，其归属仍以 `app_id` 为准；实际操作方在 `approve` 端点由真实用户的 UserAppBinding 校验授权。
+- 新增 4 项测试（`test_auth_object_access.py`）：`user_can_access_app` 布尔矩阵、`require_app_access` 跨 app 404、`_require_session_access` 跨 app 会话 404、None session 404；`_bootstrap_users_and_apps` 幂等以适配 conftest 只清 agent 表的策略。
+- `python3 -m pytest tests/ -q` 60 项全部通过；`python3 scripts/smoke_phaseA.py` A1/A2/A3 全部通过。
+- 保持 `403 vs 404` 不透露信息：跨 app 的 session_id 与不存在的 session_id 返回同样的 404 body。
 
 ---
 
@@ -192,7 +203,22 @@
 
 **验收：** 票据可使用一次，过期/重放/跨 session 均失败；日志中无长期 JWT。
 
-**状态：** ⬜ 待开始 | **依赖：** 2.1 | **下一步：** 新增 stream-ticket 端点
+**状态：** ✅ 已完成（2026-07-21） | **依赖：** 2.1 | **下一步：** 3.1 建立动作实体与状态机
+
+**验证结果：**
+- 新增 `app/core/stream_ticket.py`：`StreamTicketStore` 进程内单例，`mint(user_id, session_id)` / `consume(ticket, session_id)`；票据单次消费、短生存（默认 60s，由 `settings.agent_sse_ticket_ttl_seconds` 控制）、绑定 `(user_id, session_id)`。
+- `POST /agent/sessions/{id}/stream-ticket`：JWT 认证 + `_require_session_access` → 签发一次性票据；跨 app / 不存在 / 无权访问统一 404。
+- `GET /agent/sessions/{id}/stream`：认证优先级重排为 ticket → Authorization Header → 旧版 `?token=<长期 JWT>`；旧版路径默认拒绝，仅在 `agent_sse_allow_legacy_token=True` 时可用（灰度回滚开关）。
+- SSE 响应头新增 `Referrer-Policy: no-referrer`；即便 ticket 短暂进入 URL，也不会通过 Referer 泄漏到跨域链接。
+- 前端 `agentAPI.createStreamTicket` + `AgentConsole.jsx` 改为"先换 ticket 再开 EventSource"；`localStorage.token` 不再进入 SSE URL。
+- 新增 8 项单元测试（`test_stream_ticket.py`）：mint / 单次消费 / 跨 session 拒绝 / 过期 / 空 ticket / 未知 ticket / 单例复用 / clear 语义。
+- `python3 -m pytest tests/ -q` 68 项全部通过（+8）；`python3 scripts/smoke_phaseA.py` 全绿；`npx vite build` 成功（2457 KB，gzip 791 KB）。
+
+**外部依赖阻塞：** 无。
+
+**已知遗留：**
+- Ticket store 目前是进程内单例；多副本部署时每副本自建票据（换 session 换 ticket 天然被单节点服务），Phase 5 durable runtime 后再评估是否迁到 Redis。
+- 灰度期若 `agent_sse_allow_legacy_token=True`，长期 JWT 仍可能进入 URL；此开关应仅在切换期短暂启用。
 
 ---
 
@@ -213,7 +239,22 @@
 
 **验收：** 相同幂等键并发提交只生成一条动作且媒体只调用一次；非法状态跳转被拒绝。
 
-**状态：** ⬜ 待开始 | **依赖：** 0.2、1.1 | **下一步：** 定义 AgentActionDB 模型和状态机
+**状态：** ✅ 已完成（2026-07-21） | **依赖：** 0.2、1.1 | **下一步：** 3.2 审批过期与执行前重校验
+
+**验收结果：**
+- 新增 `AgentActionDB`（`backend/app/models/agent_runtime.py`）：`idempotency_key` UNIQUE、`state` 索引、`app_id+state` 复合索引；`intent_execution_id` / `action_log_id` 软链接既有审计链，`execution_mode`、`platform`、`account_id`、`predicted_impact_json`、`pre_state_json`、`provider_request_id/response`、`error`、四段时间戳齐备。
+- Alembic 迁移 `2ba2dc778e26_phase3_1_agent_actions`：空库 `upgrade head` 到最新版；`smartua.db` 已同步执行。
+- 新增 `AgentActionStore`（`backend/app/services/agent_runtime/action_store.py`）：`mint_or_get()` 遇 IntegrityError 回退 SELECT，保证并发下唯一；`transition()` 走白名单状态机，非法跳转抛 `InvalidTransition`；provider 字段与审计软链接通过 kwargs 更新。
+- 新增测试 `tests/test_action_state_machine.py`（10 项）：幂等键顺序稳定、`mint_or_get` 复用、异参数分裂、happy path 时间戳、跳阶段/终态回滚拒绝、`unknown` 收敛、`get_by_idempotency_key` 一致。
+- 更新 `tests/test_migration.py`：期望 34 张表 + head revision 更新为 `2ba2dc778e26`。
+- 全量 `pytest -q`：78 项全部通过。
+- 未接线：本步骤只建立实体与状态机契约；`_write()` 尚未改为"经 outbox 派发 + 状态迁移" —— 那是 Phase 3.3 的任务。现有 `IntentExecution`/`ActionLog` 审计链保持不变，Phase 3.3 会通过软链接把两侧对齐。
+
+**外部依赖阻塞：** 无。
+
+**遗留风险：**
+- SQLite CHECK 约束未加，非法状态跳转仅靠应用层拦截；迁 PostgreSQL 时会补数据库层护栏。
+- `idempotency_key` 由 (session_id, step_id, tool, params_digest) 派生 —— Loop 尚未维持"审批 step 与执行 step 是同一条"的不变量。Phase 3.2 会冻结 step 参数，进一步保证同一提案 → 同一 step_id → 同一 idempotency_key。
 
 ---
 
@@ -231,7 +272,25 @@
 
 **验收：** 过期审批返回 409；等待期间预算/状态改变会阻止执行并产生差异说明。
 
-**状态：** ⬜ 待开始 | **依赖：** 3.1、2.1 | **下一步：** 在 approve 端点增加过期和漂移校验
+**状态：** ✅ 已完成（2026-07-21） | **依赖：** 3.1、2.1 | **下一步：** 3.3 Outbox / 执行回执 / 对账
+
+**验收结果：**
+- 新增字段 `AgentStepDB.expires_at`（DateTime，nullable）、`AgentStepDB.snapshot_json`（JSON），Alembic 迁移 `49d2e70677ed_phase3_2_approval_expiry_snapshot`（可空列，兼容既有会话）。
+- `AgentStep` pydantic 同步暴露 `expires_at` / `snapshot`；`AgentSessionStore` 持久化 + 重建时透传，跨进程/单例重启不丢失。
+- `AgentLoop._dispatch()`：L1/L2/L3 提案时冻结 (a) 实体快照（`roi/spend/status/daily_budget`，来自 `connector.current_summary()` 匹配 `entity_id` 的那一行）+ (b) `expires_at = now + settings.agent_approval_ttl_seconds`。
+- `AgentLoop.approve()`：批准分支先做 (a) 过期校验 → REJECT + 观察 + 记入 `session.context["rejected"]` + 重新规划；再做 (b) 漂移校验（`agent_approval_drift_pct`，默认 20%）→ 同样 REJECT + 附 snapshot vs current diff 观察 + 重新规划。
+- `POST /agent/sessions/{id}/approve`：批准前若步骤已过期，返回 HTTP 409 `{error: approval_expired, expires_at, message}`；重复审批同一 step 返回 409（`status != proposed`）。
+- 新增测试 `tests/test_approval_expiry_drift.py`（10 项）：提案冻结 snapshot + expires_at、持久化跨重建保留、过期跳过执行、漂移超阈值跳过执行、status 翻转视为漂移、正常路径仍执行工具、`_detect_drift` 缺失 snapshot / 零基线 / 阈值内 边界、`_summary_of` 找不到实体返回 None。
+- 更新 `tests/test_migration.py`：head revision 更新为 `49d2e70677ed`。
+- 全量 `pytest -q`：88 项全部通过（78 → 88）。
+- 未启用"超时自动执行"真实资金动作：过期一律 REJECT 后回到 running 状态，Loop 会重新观察再决策。
+
+**外部依赖阻塞：** 无。
+
+**遗留风险：**
+- 漂移仅对比 `current_summary()` 派生的 4 个字段。账户级信号（预算余额、封户）尚未纳入 —— 待 3.3 引入 Connector `read_state()` 接口后一并覆盖。
+- 快照由 `current_summary()` 派生；真实 Connector 若走 FactMediaDaily 聚合，快照会滞后当日新鲜度。这是数据链路问题，不是 3.2 引入的新风险。
+- 审批人权限校验（"批准者是否有权限触发此写动作"）目前仍复用 2.1 建立的 `user_can_access_app` —— 若未来引入角色分级（如 approver ≠ analyst），需要单独扩展。
 
 ---
 
@@ -249,7 +308,25 @@
 
 **验收：** 模拟"媒体已执行但响应丢失"，动作最终经对账变为 verified，且不产生第二次预算变更。
 
-**状态：** ⬜ 待开始 | **依赖：** 3.1、3.2 | **下一步：** 实现 outbox 模式
+**状态：** ✅ 已完成（2026-07-21） | **依赖：** 3.1、3.2 | **下一步：** 4.1 拆分三类影响
+
+**验收结果（2026-07-21）：**
+- 新增 `backend/app/services/agent_runtime/dispatcher.py`：`Dispatcher.dispatch_and_verify()` 驱动 `AgentActionDB` 走 `mint_or_get → approved → dispatching → media_call → accepted → verify → verified/unknown/failed` 状态机；提供 `reconcile()` 收敛 `unknown` 动作。
+- 新增 `BaseConnector.read_state(entity_id)`：默认从 `current_summary()` 派生（status/daily_budget/roi/spend/cpi），真实 Connector 可以按需覆盖走原生 API。
+- Loop 接线：`AgentLoop._execute_approved_write` / `_execute_l0_write` 将审批通过或 L0 自动的写动作交给 Dispatcher；`tool.handler` 作为 `media_call` 被包装，既完成媒体调用，也保留既有 `IntentExecution` + `ActionLog` 审计链（软链接由 Dispatcher 未来落地）。
+- 幂等：同一 `idempotency_key` 重放 `dispatch_and_verify` → 命中终态短路，不重复叫媒体（`test_happy_path_reaches_verified_and_calls_media_once` 断言 `call_count == 1`）。
+- 不确定路径：媒体 `raise` → `unknown`；返回 `success=False` → `failed`；返回缺 `success` 字段 → `unknown`（不冒充成功）。
+- 回读判定：`update_campaign_status` 严格比对 `status`；`update_campaign_budget` 相对差 ≤ 5% 视为一致；未匹配 → `unknown`，等 `reconcile` 收敛（+/− 无 read_state 也走 `unknown`）。
+- `reconcile()`：`unknown → verified`（匹配）或 `unknown → failed`（明确不匹配）；`verified/failed` 是 no-op。
+- 测试：新增 `backend/tests/test_dispatcher.py` 14 用例 —— happy path 幂等 / verified 短路 / 媒体异常 / 明确失败 / 返回值歧义 / read_state 缺失 / 回读不匹配 / 无 entity_id / 预算相对差匹配与偏离 / reconcile 三条收敛路径。全套 102 pytest 通过。
+
+**外部依赖阻塞：** 无。持久化 outbox + 独立 worker + lease 明确划入 Phase 5.2；本步骤刻意保持同步 dispatcher，避免在 SQLite / 单进程场景引入本不需要的复杂度。
+
+**遗留风险 / 待办：**
+- 同步 dispatcher 在进程崩溃时仍会丢失 in-flight 动作（不会双发媒体，但会需要更多次 reconcile）。Phase 5.2 通过 durable outbox + worker lease 消除。
+- `IntentExecution` / `ActionLog` 与 `AgentActionDB` 的软链接目前只在 dispatcher 层预留字段，尚未由 `tool.handler` 主动回写 `intent_execution_id` / `action_log_id`。属于对账反查便利性问题，不影响状态机正确性 —— Phase 4 收集 observed_impact 时会顺手把链接补上。
+- `read_state()` 默认实现依赖 `current_summary()`，在真实 Connector（Google/TikTok）尚未走 native `campaigns.get()` 之前，回读的粒度和新鲜度会受限。Phase 6 只读工具扩充时会给 Google Connector 落 `read_state` 的原生实现。
+- Loop `_dispatch_via_action_store` 在 `ctx.db is None`（demo 脚本）时回退到旧的直接 handler 路径 —— 与生产状态机不一致，但兼容 `scripts/demo_phase4.py`。生产运行时始终有 DB，`app_id` 授权也强制持库。
 
 ---
 
