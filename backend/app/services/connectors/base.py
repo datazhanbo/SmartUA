@@ -506,7 +506,8 @@ class BaseConnector(ABC):
         意图引擎零改动。子类可重写以实现自定义语义；默认实现映射到标准 update_* 方法。
 
         支持的动作：
-        - update_campaign_status / update_campaign_budget / update_adset_bid
+        - update_campaign_status / update_campaign_budget
+        - update_adset_status / update_adset_bid
         - rotate_creative（仅当连接器实现了该方法，如 MockMediaConnector）
 
         写成功后自动回写 dim_campaign_structure，使 current_summary() 能反映最新
@@ -518,6 +519,11 @@ class BaseConnector(ABC):
             result = self.update_campaign_budget(entity_id, float(params.get("daily_budget", 0)))
         elif action == "update_adset_bid":
             result = self.update_adset_bid(entity_id, float(params.get("bid_amount", 1.0)))
+        elif action == "update_adset_status":
+            fn = getattr(self, "update_adset_status", None)
+            if fn is None:
+                return {"success": False, "error": f"{self.platform} 连接器不支持 update_adset_status"}
+            result = fn(entity_id, params.get("status", "ACTIVE"))
         elif action == "rotate_creative":
             fn = getattr(self, "rotate_creative", None)
             if fn is None:
@@ -607,6 +613,9 @@ class BaseConnector(ABC):
         elif action == "update_adset_bid":
             level = "adset"
             fields["bid_amount"] = float(params.get("bid_amount", 0))
+        elif action == "update_adset_status":
+            level = "adset"
+            fields["status"] = str(params.get("status", "ACTIVE")).upper()
         else:
             return
         from app.models.data import DimCampaignStructure

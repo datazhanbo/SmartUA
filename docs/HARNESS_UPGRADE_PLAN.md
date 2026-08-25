@@ -85,7 +85,10 @@ agent_runtime/tools/
 
 ---
 
-### 3. AdSet/Ad 粒度 Connector（P1，Phase B）
+### 3. AdSet/Ad 粒度 Connector（P1，Phase B） — ✅ 2026-08-25 mock/sandbox 层完成
+
+> 变更说明：[changes/2026-08-25-adset-ad-granularity.md](changes/2026-08-25-adset-ad-granularity.md)。
+> 本轮交付 mock/sandbox 端到端（Definition + Mock Provider + Consumer 工具 + 测试）；live 凭证接入为后续子项。
 
 **现状**：Connector 抽象在 `connectors/base.py`（`apply_action` / `read_state` / `save_ods` / `save_dwd` / `execute_pull`），实现有 mock_media、meta、google、tiktok、appsflyer。`execution_mode ∈ mock/sandbox/live` 隔离已到位。但工具粒度只到 Campaign，无 AdSet/Ad 层。真实媒体凭证未接通（默认 mock，Meta 被封拒写，TikTok/Google 代码就绪未 live）。
 
@@ -118,6 +121,14 @@ Consumer 层：`builtin/` 新增 4 个工具——`observe_adsets`(L0)、`adjust
 - live mode 下 Meta Connector 对未实现的方法显式 raise NotImplementedError（fail-closed）
 
 **顺序**：先 mock 实现 + 测试 → 再接 live 凭证。execution_mode 隔离已经在了，别浪费——先在 sandbox 里验证逻辑，碰真实 API 是最后一步。
+
+**完成情况（2026-08-25）**：
+- ✅ 模拟引擎新增 AdSet/Ad 状态，每个 campaign seed 2 AdSet × 2 Ad；修复 `update_adset_bid` 误改 campaign 的潜在 bug。
+- ✅ `BaseConnector.apply_action` 新增 `update_adset_status`，未实现的连接器 fail-closed 返回 `success=False`（不抛异常）。
+- ✅ 4 个工具落地：`observe_adsets`(L0)、`evaluate_creative`(L0)、`pause_adset`(L1) 新增；`adjust_bid`(L2) 即计划中的 `adjust_adset_bid`，修正为真正作用于 AdSet。
+- ✅ `loop.py` 零改动（新增工具直接注册，pipeline/BudgetGuard 自动生效）；155 passed（140 + 15 新增）。
+- ⏳ live 凭证：Meta/TikTok adset 写仍为 mock 占位；Google `update_adset_status` 待补；下一轮接入。
+- ⏳ 前端 AdSet/Ad 视图、planner 对低 ROI/fatigued adset 的自动提议为后续项。
 
 ---
 
@@ -168,7 +179,7 @@ README 顶部已加 Quick Start 段落，写清每条命令做了什么，并说
 |------|--------|--------|------|------|
 | 1 | Tool Pipeline Middleware | P0 | 2-3 天 | ✅ 2026-08-25 完成 |
 | 5 | Makefile 启动 | P2 | 半天 | ✅ 2026-08-25 完成 |
-| 3 | AdSet/Ad 粒度 Connector | P1 | 3-4 天 | ⏳ 待执行（#1 完成后更干净） |
+| 3 | AdSet/Ad 粒度 Connector | P1 | 3-4 天 | ✅ mock/sandbox 层 2026-08-25 完成（live 待接） |
 | 2 | MCP Provider + Skill Loader | P1 | 3-5 天 | ⏳ 待执行（#1） |
 | 4 | Durable Jobs | P2 | 2-3 天 | ⏳ 待执行（#1 后 job 触发逻辑更清晰） |
 

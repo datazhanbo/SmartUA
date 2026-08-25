@@ -68,6 +68,7 @@ TOOL_TO_ACTION: Dict[str, Any] = {
     "resume_campaign":  ("update_campaign_status", lambda p: {"status": "ACTIVE"}),
     "adjust_budget":    ("update_campaign_budget", lambda p: {"daily_budget": float(p["daily_budget"])}),
     "adjust_bid":       ("update_adset_bid", lambda p: {"bid_amount": float(p["bid_amount"])}),
+    "pause_adset":      ("update_adset_status", lambda p: {"status": "PAUSED"}),
     "rotate_creative":  ("rotate_creative", lambda p: {}),
 }
 
@@ -128,6 +129,38 @@ def _simulate(params: Dict, ctx: AgentContext) -> ToolResult:
            f"  ΔSpend(首日)={d_spend[0] if d_spend else 0:+.1f}")
     return ToolResult(ok=True, observation=obs,
                       data={"delta_roi": d_roi, "delta_spend": d_spend, "delta_cpi": eff.delta_cpi})
+
+
+def _observe_adsets(params: Dict, ctx: AgentContext) -> ToolResult:
+    campaign_id = params.get("campaign_id")
+    rows = ctx.connector.list_adsets(campaign_id=campaign_id) \
+        if hasattr(ctx.connector, "list_adsets") else []
+    if not rows:
+        return ToolResult(ok=True, observation="（无 AdSet 数据）", data={"adsets": []})
+    lines = [
+        f"{r['adset_id']:<18}{r['status']:<8}bid={r['bid']:.2f} "
+        f"spend={r['spend']:>7.0f} roi={r['roi']:>5.2f} cpi={r['cpi']:>6.2f} fatigue={r['fatigue']:.2f}"
+        for r in rows
+    ]
+    obs = "AdSet 概览" + (f"（campaign={campaign_id}）" if campaign_id else "") + "：\n" + "\n".join(lines)
+    return ToolResult(ok=True, observation=obs, data={"adsets": rows})
+
+
+def _evaluate_creative(params: Dict, ctx: AgentContext) -> ToolResult:
+    adset_id = params.get("adset_id")
+    rows = ctx.connector.evaluate_creative(adset_id=adset_id) \
+        if hasattr(ctx.connector, "evaluate_creative") else []
+    if not rows:
+        return ToolResult(ok=True, observation="（无 Ad/素材数据）", data={"creatives": []})
+    lines = []
+    for r in rows:
+        lines.append(
+            f"{r['ad_id']:<22}{r['health']:<16}age={r['creative_age']:>2} "
+            f"ctr={r['ctr']:.5f} roi={r['roi']:>5.2f}"
+            + (f" → 建议 {r['suggested_action']}" if r['suggested_action'] else "")
+        )
+    obs = "素材健康度评估" + (f"（adset={adset_id}）" if adset_id else "") + "：\n" + "\n".join(lines)
+    return ToolResult(ok=True, observation=obs, data={"creatives": rows})
 
 
 def _report(params: Dict, ctx: AgentContext) -> ToolResult:
@@ -235,6 +268,12 @@ def _bid(params: Dict, ctx: AgentContext) -> ToolResult:
     b = float(params["bid_amount"])
     return _write(ctx, "update_adset_bid", eid, {"bid_amount": b},
                   "L2", "campaign.bid_adjust", f"调整 {eid} 出价为 {b:.2f}x", "adjust_bid")
+
+
+def _pause_adset(params: Dict, ctx: AgentContext) -> ToolResult:
+    eid = params["entity_id"]
+    return _write(ctx, "update_adset_status", eid, {"status": "PAUSED"},
+                  "L1", "adset.pause", f"暂停广告组 {eid}（止损）", "pause_adset")
 
 
 def _rotate(params: Dict, ctx: AgentContext) -> ToolResult:
@@ -503,6 +542,15 @@ def _build_registry() -> Dict[str, Tool]:
         "rotate_creative": Tool(
             "rotate_creative", "轮换素材（重置素材疲劳，短期提升 CTR）",
             "L0", "write", '{"entity_id":<str>}', _rotate),
+        "observe_adsets": Tool(
+            "observe_adsets", "读取 AdSet（广告组）层指标：出价/状态/ROI/疲劳度，可按 campaign 过滤",
+            "L0", "read", '{"campaign_id":<str,可选>}', _observe_adsets),
+        "pause_adset": Tool(
+            "pause_adset", "暂停指定 AdSet（广告组级止损）",
+            "L1", "write", '{"entity_id":<str>}', _pause_adset),
+        "evaluate_creative": Tool(
+            "evaluate_creative", "评估 Ad 层素材健康度（healthy/fatigued/underperforming）并给出换素材建议",
+            "L0", "read", '{"adset_id":<str,可选>}', _evaluate_creative),
         "market_research": Tool(
             "market_research",
             "跳出平台内部数据，从市场/行业视角检索 CPI/CPA/ROAS 基准与外部信息"

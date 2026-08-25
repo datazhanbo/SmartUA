@@ -41,7 +41,7 @@ v3 阶段既不接生产多媒体真实凭证，也不上 durable worker（Phase
 | **`planner.py`** | 规则引擎兜底规划（纯函数）：暂停低 ROI / 高 ROI 加预算 / 换素材 / 出报告 + 解析函数 | v4 新增 |
 | **`pipeline/`** | Tool Pipeline Middleware 包（base/registry/risk_level/approval/executor/budget_guard） | v4 新增 |
 | `session.py` | AgentSession / Step / Store；response schema 携带 `execution_mode` / `account_id` / `verified_at` | 未变 |
-| `tools.py` | ToolRegistry + 9 工具；`_write` 通过 dispatcher 派发；`record_execution` 仍在本文件（被 pipeline/executor 复用） | 未变 |
+| `tools.py` | ToolRegistry + 13 工具（新增 `observe_adsets`/`pause_adset`/`evaluate_creative`，`adjust_bid` 修正为真正作用于 AdSet）；`_write` 通过 dispatcher 派发；`record_execution` 仍在本文件（被 pipeline/executor 复用） | v4.1 增补 |
 | `memory.py` | Episode dataclass；`usable_episodes()` / `promote_usable_for_learning()` 门禁入口 | 未变 |
 | `reflection.py` | Reflector 摘要 | 未变 |
 | `strategy.py` | StrategyStore；`learn_from_memory` 只读 usable Episode | 未变 |
@@ -331,6 +331,7 @@ a3e6a8c67106_phase4_3_episode_learning_gate     ← HEAD
 
 - **autonomy 未接 pipeline**：`autonomy.py::handle_anomaly` 主动巡检的写动作仍直调 `tool.handler`，BudgetGuard 不生效；下一轮接入 middleware。
 - **审批入口双实现**：同步 409 路径（`api/v1/agent.py::approve_step`）与 `loop.approve` 共用 `check_approval` 但未合并入口。
+- **AdSet/Ad live 凭证未接**：v4.1 已在 mock 引擎落地 AdSet/Ad 层 + 3 个新工具（`observe_adsets`/`pause_adset`/`evaluate_creative`），但 Meta/TikTok 的 adset 写仍是 mock 占位，Google `update_adset_status` 待补；planner 尚未对低 ROI/fatigued adset 自动提议。详见 [changes/2026-08-25-adset-ad-granularity.md](changes/2026-08-25-adset-ad-granularity.md)。
 - **未接生产多媒体真实凭证**：Google live 已具备 fail-closed 路径，但真实凭证由运维配置后再切；TikTok 直到真实 API 上线之前禁 live；Meta 恢复后可切回。
 - **单进程 collector**：`run_due_jobs` 需外部周期调用；多副本情况下的重复回采要等 Phase 5.2/5.4 的 durable worker + 独立调度。
 - **PostgreSQL 迁移未开始**：仍是 SQLite；Phase 5.1 将做 schema + 数据迁移，AsyncSession 逐步替换热路径。

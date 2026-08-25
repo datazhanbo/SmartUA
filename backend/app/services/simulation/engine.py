@@ -65,6 +65,39 @@ class CampaignState:
 
 
 @dataclass
+class AdSetState:
+    """单个 AdSet（广告组）的持久状态。归属某个 campaign，拥有独立出价与状态。"""
+
+    id: str
+    name: str
+    campaign_id: str
+    status: str = "ACTIVE"          # ACTIVE / PAUSED
+    bid: float = 1.0               # 出价倍率（1.0=基准）
+    # 质量参数（由 id 派生，模拟广告组间差异）
+    base_ctr: float = 0.01
+    ctr_fatigue: float = 0.0       # 创意疲劳累积（驱动 evaluate_creative）
+    cpi: float = 0.0
+    roi: float = 0.0
+    spend: float = 0.0
+
+
+@dataclass
+class AdState:
+    """单个 Ad（广告）的状态。归属某个 AdSet，挂载一个 creative。"""
+
+    id: str
+    name: str
+    adset_id: str
+    creative_id: str
+    status: str = "ACTIVE"
+    creative_age: int = 0
+    ctr: float = 0.0
+    cpi: float = 0.0
+    roi: float = 0.0
+    spend: float = 0.0
+
+
+@dataclass
 class DayRow:
     """某 campaign 某天的指标快照。"""
 
@@ -135,6 +168,8 @@ class SimulationEngine:
         self.seed = seed
         self._rng = random.Random(seed)
         self.campaigns: Dict[str, CampaignState] = {}
+        self.adsets: Dict[str, AdSetState] = {}
+        self.ads: Dict[str, AdState] = {}
         self.history: List[Dict] = []   # [{"date":..., "rows":[DayRow,...]}, ...]
         self._today: Optional[date] = None
         self.account_status: str = "ok"   # 媒体账户状态（主动自治检测器据此判断是否被封/受限）
@@ -169,7 +204,38 @@ class SimulationEngine:
                 base_ctr=ctr, capacity=cap, payer_rate=pr, ltv_per_payer=ltv,
             )
             self.add_campaign(c)
+            self._seed_adsets_for(cid, ctr, i)
         return self
+
+    def _seed_adsets_for(self, campaign_id: str, base_ctr: float, salt: int) -> None:
+        """每个 campaign 挂 2 个 AdSet（一好一差），每个 AdSet 挂 2 个 Ad。"""
+        rng = random.Random(hash(("adset", campaign_id, salt)) & 0xFFFFFFFF)
+        specs = [
+            ("win", 1.05, 0.0),   # 高出价、低疲劳（优质组）
+            ("fatigued", 0.95, 0.6),  # 低出价、高疲劳（待换素材/暂停）
+        ]
+        for j, (tag, bid, fatigue) in enumerate(specs):
+            aid = f"{campaign_id}_as{j+1}"
+            ctr = round(base_ctr * (1.15 if tag == "win" else 0.7) * rng.uniform(0.9, 1.1), 5)
+            spend = round(rng.uniform(80, 320), 2)
+            cpi = round(rng.uniform(0.8, 3.5), 2)
+            roi = round(rng.uniform(1.4, 2.2) if tag == "win" else rng.uniform(0.3, 0.9), 3)
+            self.adsets[aid] = AdSetState(
+                id=aid, name=f"AdSet_{tag.upper()}", campaign_id=campaign_id,
+                bid=bid, base_ctr=ctr, ctr_fatigue=fatigue,
+                cpi=cpi, roi=roi, spend=spend,
+            )
+            for k in range(2):
+                ad_id = f"{aid}_ad{k+1}"
+                cr_id = f"{aid}_cr{k+1}"
+                ad_ctr = round(ctr * rng.uniform(0.8, 1.2), 5)
+                self.ads[ad_id] = AdState(
+                    id=ad_id, name=f"Ad_{k+1}", adset_id=aid, creative_id=cr_id,
+                    creative_age=int(fatigue * 10) + k, ctr=ad_ctr,
+                    cpi=round(cpi * rng.uniform(0.9, 1.2), 2),
+                    roi=round(roi * rng.uniform(0.85, 1.15), 3),
+                    spend=round(spend * rng.uniform(0.3, 0.6), 2),
+                )
 
     # ----------------------------- 时间推进 ----------------------------- #
     def advance_day(self, dt: Optional[date] = None) -> List[DayRow]:
@@ -198,7 +264,11 @@ class SimulationEngine:
 
     # ----------------------------- 动作 ----------------------------- #
     def apply_action(self, action: str, entity_id: str, **params) -> Dict:
-        """施加一个写动作，真实修改 campaign 状态。返回执行结果。"""
+        """施加一个写动作，真实修改 campaign / adset 状态。返回执行结果。"""
+        # AdSet 层动作：先于 campaign 查找，避免把 adset_id 误判为 campaign 缺失
+        if action in ("update_adset_bid", "update_adset_status"):
+            return self._apply_adset(action, entity_id, params)
+
         c = self.campaigns.get(entity_id)
         if not c:
             return {"success": False, "error": f"campaign not found: {entity_id}"}
@@ -213,20 +283,36 @@ class SimulationEngine:
             if new_b <= 0:
                 return {"success": False, "error": "budget must be positive"}
             c.daily_budget = new_b
-        elif action == "update_adset_bid":
-            mult = float(params.get("bid_amount", c.bid_mult))
-            if mult <= 0:
-                return {"success": False, "error": "bid must be positive"}
-            c.bid_mult = mult
         elif action == "rotate_creative":
             c.creative_age = 0  # 重置疲劳并触发 fresh 提升
         else:
             return {"success": False, "error": f"unknown action: {action}"}
+        return self._ok(action, entity_id, c)
 
+    def _apply_adset(self, action: str, entity_id: str, params: Dict) -> Dict:
+        a = self.adsets.get(entity_id)
+        if not a:
+            return {"success": False, "error": f"adset not found: {entity_id}"}
+        if action == "update_adset_bid":
+            bid = float(params.get("bid_amount", a.bid))
+            if bid <= 0:
+                return {"success": False, "error": "bid must be positive"}
+            a.bid = bid
+        else:  # update_adset_status
+            status = str(params.get("status", "")).upper()
+            if status not in ("ACTIVE", "PAUSED"):
+                return {"success": False, "error": f"invalid status: {status}"}
+            a.status = status
         return {
-            "success": True,
-            "action": action,
-            "entity_id": entity_id,
+            "success": True, "action": action, "entity_id": entity_id,
+            "new_state": {"status": a.status, "bid": a.bid,
+                          "campaign_id": a.campaign_id, "name": a.name},
+            "mode": "mock-sim",
+        }
+
+    def _ok(self, action: str, entity_id: str, c: CampaignState) -> Dict:
+        return {
+            "success": True, "action": action, "entity_id": entity_id,
             "new_state": {
                 "status": c.status,
                 "daily_budget": c.daily_budget,
@@ -235,6 +321,45 @@ class SimulationEngine:
             },
             "mode": "mock-sim",
         }
+
+    # ----------------------------- AdSet/Ad 读取 ----------------------------- #
+    def adsets_summary(self, campaign_id: Optional[str] = None) -> List[Dict]:
+        """返回 AdSet 层概览，供 observe_adsets / evaluate_creative 使用。"""
+        out = []
+        for a in self.adsets.values():
+            if campaign_id and a.campaign_id != campaign_id:
+                continue
+            out.append({
+                "adset_id": a.id, "name": a.name, "campaign_id": a.campaign_id,
+                "status": a.status, "bid": a.bid, "ctr": round(a.base_ctr * (1.0 - a.ctr_fatigue), 5),
+                "cpi": a.cpi, "roi": a.roi, "spend": a.spend,
+                "fatigue": round(a.ctr_fatigue, 2),
+            })
+        return out
+
+    def evaluate_creative_health(self, adset_id: Optional[str] = None) -> List[Dict]:
+        """评估 Ad 层素材健康度：基于 ctr/疲劳/ROI 给出 healthy/fatigued/underperforming。"""
+        out = []
+        for ad in self.ads.values():
+            if adset_id and ad.adset_id != adset_id:
+                continue
+            fatigue = ad.creative_age
+            if fatigue >= 8 or ad.roi < 0.8:
+                health = "fatigued"
+                suggest = "rotate_creative"
+            elif ad.roi < 1.0:
+                health = "underperforming"
+                suggest = "observe_adsets"
+            else:
+                health = "healthy"
+                suggest = None
+            out.append({
+                "ad_id": ad.id, "name": ad.name, "adset_id": ad.adset_id,
+                "creative_id": ad.creative_id, "creative_age": fatigue,
+                "ctr": ad.ctr, "cpi": ad.cpi, "roi": ad.roi, "spend": ad.spend,
+                "health": health, "suggested_action": suggest,
+            })
+        return out
 
     # ----------------------------- 读取 ----------------------------- #
     def get_history(self, date_from: date, date_to: date) -> List[Dict]:
@@ -383,6 +508,8 @@ class SimulationEngine:
 
     def reset(self) -> "SimulationEngine":
         self.campaigns.clear()
+        self.adsets.clear()
+        self.ads.clear()
         self.history.clear()
         self._today = None
         self.account_status = "ok"

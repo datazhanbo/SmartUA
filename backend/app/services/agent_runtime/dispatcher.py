@@ -67,14 +67,14 @@ def _verify_state(current: Optional[Dict[str, Any]], req: ActionRequest) -> Tupl
     """回读后判定动作是否已生效。返回 (matched, reason)。
 
     覆盖 Loop 目前会派发的写工具：
-    - `update_campaign_status` → 期望 status == req.request["status"]
+    - `update_campaign_status` / `update_adset_status` → 期望 status == req.request["status"]
     - `update_campaign_budget` → 期望 daily_budget ≈ req.request["daily_budget"]（相对差 ≤ 5%）
     - `update_adset_bid` / `rotate_creative` → 无直接可读字段 → 有 state 即认为 verified
     """
     if current is None:
         return False, "read_state returned None"
     action = req.action
-    if action == "update_campaign_status":
+    if action in ("update_campaign_status", "update_adset_status"):
         expected = str(req.request.get("status", "")).upper()
         got = str(current.get("status", "")).upper()
         return (expected == got, f"status expected={expected} got={got}")

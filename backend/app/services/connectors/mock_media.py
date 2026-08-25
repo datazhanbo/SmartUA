@@ -142,8 +142,18 @@ class MockMediaConnector(BaseConnector):
     def update_adset_bid(self, adset_id: str, bid_amount: float) -> Dict[str, Any]:
         return self.engine.apply_action("update_adset_bid", adset_id, bid_amount=bid_amount)
 
+    def update_adset_status(self, adset_id: str, status: str) -> Dict[str, Any]:
+        return self.engine.apply_action("update_adset_status", adset_id, status=status)
+
     def rotate_creative(self, campaign_id: str) -> Dict[str, Any]:
         return self.engine.apply_action("rotate_creative", campaign_id)
+
+    # ---------------- AdSet / Ad 粒度读 ---------------- #
+    def list_adsets(self, campaign_id: str = None) -> List[Dict[str, Any]]:
+        return self.engine.adsets_summary(campaign_id=campaign_id)
+
+    def evaluate_creative(self, adset_id: str = None) -> List[Dict[str, Any]]:
+        return self.engine.evaluate_creative_health(adset_id=adset_id)
 
     # ---------------- agent 辅助接口 ---------------- #
     def account_status(self) -> str:
@@ -165,6 +175,20 @@ class MockMediaConnector(BaseConnector):
         重复提议已被处置的 campaign。
         """
         return self.engine.live_summary()
+
+    def read_state(self, entity_id: str) -> Optional[Dict[str, Any]]:
+        """回读实体最新状态。先按 AdSet 匹配，再回退 campaign 概览。"""
+        if not entity_id:
+            return None
+        adset = self.engine.adsets.get(entity_id)
+        if adset is not None:
+            return {
+                "entity_level": "adset", "status": adset.status,
+                "bid": adset.bid, "campaign_id": adset.campaign_id,
+                "daily_budget": None, "roi": adset.roi, "spend": adset.spend,
+                "cpi": adset.cpi,
+            }
+        return super().read_state(entity_id)
 
     def simulate_impact(self, action: str, entity_id: str, params: Dict, horizon: int = 7):
         """包装引擎的影响评估，供反思模块调用。"""

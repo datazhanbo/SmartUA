@@ -2,6 +2,7 @@
 
 > 较大的变更单独归档到 `docs/changes/`，这里只留一行索引，避免堆叠影响阅读。
 
+- 2026-08-25 — P1 #3：AdSet/Ad 粒度 Connector + 工具（新增 observe_adsets/pause_adset/evaluate_creative，loop.py 未改仍 437 行，155 测试全绿）。详见 [changes/2026-08-25-adset-ad-granularity.md](changes/2026-08-25-adset-ad-granularity.md)。
 - 2026-08-25 — P0 升级：Tool Pipeline Middleware + Makefile（loop.py 799→437 行，新增 BudgetGuard，140 测试全绿）。详见 [changes/2026-08-25-tool-pipeline-middleware.md](changes/2026-08-25-tool-pipeline-middleware.md)。
 
 ---
