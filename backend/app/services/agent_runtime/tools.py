@@ -564,8 +564,62 @@ def _build_registry() -> Dict[str, Tool]:
 
 class ToolRegistry:
     def __init__(self):
-        self._tools = _build_registry()
+        self._tools: Dict[str, Tool] = _build_registry()
+        self._providers: Dict[str, Any] = {}   # name -> ToolProvider
+        self._refresh_providers()
 
+    # ---------- 内置工具 ----------
+    def register_tool(self, tool: Tool) -> None:
+        """注册单个内置工具（覆盖同名）。"""
+        self._tools[tool.name] = tool
+
+    # ---------- Provider ----------
+    def register_provider(self, provider) -> None:
+        """挂载一个 ToolProvider；其工具被并入 registry。同名 provider 会被替换并 close 旧的。"""
+        old = self._providers.pop(provider.name, None)
+        if old is not None and old is not provider:
+            try:
+                old.close()
+            except Exception:
+                pass
+        self._providers[provider.name] = provider
+        self._refresh_providers()
+
+    def unregister_provider(self, name: str) -> None:
+        p = self._providers.pop(name, None)
+        if p is not None:
+            try:
+                p.close()
+            except Exception:
+                pass
+        # 清理该 provider 贡献的工具（前缀 name__）
+        prefix = f"{name}__"
+        for tname in list(self._tools.keys()):
+            if tname.startswith(prefix):
+                del self._tools[tname]
+
+    def refresh_providers(self) -> None:
+        """重新拉取所有 provider 的工具列表（不重启服务）。"""
+        self._refresh_providers()
+
+    def _refresh_providers(self) -> None:
+        for p in self._providers.values():
+            prefix = f"{p.name}__"
+            # 先清掉该 provider 上次贡献的工具，避免已删除工具残留
+            for tname in list(self._tools.keys()):
+                if tname.startswith(prefix):
+                    del self._tools[tname]
+            try:
+                tools = p.list_tools()
+            except Exception:
+                tools = []
+            for t in tools:
+                self._tools[t.name] = t
+
+    def provider_names(self) -> List[str]:
+        return list(self._providers.keys())
+
+    # ---------- 查询 ----------
     def get(self, name: str) -> Optional[Tool]:
         return self._tools.get(name)
 

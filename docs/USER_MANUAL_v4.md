@@ -134,6 +134,48 @@ v4 起，带 `daily_budget` 的写动作在**进入审批之前**会先过预算
 
 > 这是"AI 建议、人做决策"的第一道闸：明显越权的预算上调在机器侧就挡掉，只有合理范围内的调整才进入人审。
 
+### 4.5 Skill：优化师预置流程（v4.2 新增）
+
+Skill 是放在 `backend/data/skills/*.md` 的**小文件**，用来教 Agent "在什么场景下、用什么默认参数、按什么流程调已有工具"。它**不增加新工具**，只做两件事：
+
+1. 给 `target_tool` 合并一组默认参数（你或模型显式给的参数优先，不会被覆盖）。
+2. 把正文作为流程提示拼到 Agent 的 system prompt 里。
+
+示例 `scale_winning_campaign.md`：
+
+```markdown
+---
+name: scale_winning_campaign
+target_tool: adjust_budget
+params:
+  _pct: 0.20
+when: 用户要求"放量"且 ROI ≥ 1.5
+---
+1. 先 observe_campaigns 找高 ROI campaign。
+2. simulate_impact 预测 +20% 的影响。
+3. 调 adjust_budget，daily_budget = 当前 × 1.20。
+```
+
+完整 frontmatter 规范见 [SKILL_SYSTEM.md](SKILL_SYSTEM.md)。改完 skill 重启后端生效（或调 `get_skill_store().reload()` 热刷新）。
+
+### 4.6 MCP Provider：接入外部工具（v4.2 新增）
+
+Agent 可以通过 MCP (Model Context Protocol) 调用外部 server 暴露的工具。配置 `AGENT_MCP_SERVERS` 后，每个外部工具会以 `{provider}__{tool}` 的名字出现在 Agent 可用工具列表里，和内置工具一样**走预算护栏 / 审批 / 审计**。
+
+安全缺省：
+
+- 只读工具（MCP 标注 `readOnlyHint=true` 或工具名以 `get/list/search/observe/...` 开头）→ L0 自动执行。
+- 其它写工具默认 **L3**（必须人审）；要降级在配置里显式写 `tool_risk`。
+- 外部 server 连不上时记 warning 并返回空工具列表，不影响 Agent 启动。
+
+示例：
+
+```bash
+AGENT_MCP_ENABLED=true
+AGENT_MCP_SERVERS='[{"name":"af","url":"https://mcp.example.com/mcp",
+  "headers":{"Authorization":"Bearer xxx"},"tool_risk":{"update_bid":"L1"}}]'
+```
+
 ---
 
 ## 5. 写动作的三档影响
@@ -227,6 +269,10 @@ Note 前缀 `[usable=N 条真实样本]`，例如：
 | `agent_sse_allow_legacy_query_token` | `false` | 生产必须关闭 |
 | `agent_budget_guard_enabled` | `true` | 预算护栏总开关（v4） |
 | `agent_budget_max_increase_pct` | `0.50` | 单日预算增幅上限（相对值，0.50 = 50%，v4） |
+| `agent_mcp_enabled` | `false` | 是否启用 MCP 外部工具源（v4.2） |
+| `agent_mcp_servers` | `[]` | MCP server 列表 JSON：`name/url/headers/timeout/tool_risk`（v4.2） |
+| `agent_skills_enabled` | `true` | 是否加载 `data/skills/*.md`（v4.2） |
+| `agent_skills_dir` | `backend/data/skills` | skill 目录（v4.2） |
 | `agent_strategy_path` | `backend/data/strategy.json` | 策略落盘路径 |
 
 启动前置：`alembic upgrade head` —— v3 起 schema 由 Alembic 管理，`create_all()` 仅保留在测试路径。

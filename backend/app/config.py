@@ -97,6 +97,18 @@ class Settings(BaseSettings):
     agent_budget_guard_enabled: bool = True
     agent_budget_max_increase_pct: float = 0.50
 
+    # ===== P1 #2: MCP Provider + Skill Loader =====
+    # 是否启用外部 MCP 工具源（streamable-http JSON-RPC）。
+    agent_mcp_enabled: bool = False
+    # MCP server 列表（JSON 字符串或 list）：[{"name":"af","url":"https://...",
+    #   "headers":{"Authorization":"Bearer ..."},"tool_risk":{"some_write":"L1"}}]
+    agent_mcp_servers: List[Dict[str, Any]] = []
+    # Skill 目录（.md frontmatter）。空=不加载。
+    agent_skills_enabled: bool = True
+    agent_skills_dir: Optional[str] = str(
+        Path(__file__).resolve().parent.parent / "data" / "skills"
+    )
+
     # ===== Phase 2.2 SSE 认证 =====
     # SSE stream-ticket 生存期（秒）：短期 + 单次 + 绑定 (user, session)。
     agent_sse_ticket_ttl_seconds: int = 60

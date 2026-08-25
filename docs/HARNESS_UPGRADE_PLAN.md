@@ -2,8 +2,8 @@
 
 > 基于 2026-08 DeepSeek Harness (DSH) / OpenAI Codex Harness / OpenClaw 三家开源 runtime 的架构调研，对 SmartUA 现有实现的补强建议。
 > 创建：2026-08-24
-> 状态：P0（#1 Tool Pipeline Middleware、#5 Makefile）已于 2026-08-25 完成 ✅；#2/#3/#4 待执行
-> 关联：[ARCHITECTURE_v4.md](ARCHITECTURE_v4.md)、[TOOL_PIPELINE_v1.md](TOOL_PIPELINE_v1.md)、[changes/2026-08-25-tool-pipeline-middleware.md](changes/2026-08-25-tool-pipeline-middleware.md)、[CONNECTOR_DESIGN_v3.md](CONNECTOR_DESIGN_v3.md)、[AGENT_ITERATION_ROADMAP.md](AGENT_ITERATION_ROADMAP.md)
+> 状态：P0（#1 Tool Pipeline Middleware、#5 Makefile）于 2026-08-25 完成 ✅；P1 #3（AdSet/Ad 粒度 mock/sandbox 层）于 2026-08-25 完成 ✅；P1 #2（MCP Provider + Skill Loader）于 2026-08-25 完成 ✅；P2 #4 待执行。
+> 关联：[ARCHITECTURE_v4.md](ARCHITECTURE_v4.md)、[TOOL_PIPELINE_v1.md](TOOL_PIPELINE_v1.md)、[SKILL_SYSTEM.md](SKILL_SYSTEM.md)、[changes/2026-08-25-tool-pipeline-middleware.md](changes/2026-08-25-tool-pipeline-middleware.md)、[changes/2026-08-25-adset-ad-granularity.md](changes/2026-08-25-adset-ad-granularity.md)、[changes/2026-08-25-mcp-provider-skill-loader.md](changes/2026-08-25-mcp-provider-skill-loader.md)、[CONNECTOR_DESIGN_v3.md](CONNECTOR_DESIGN_v3.md)、[AGENT_ITERATION_ROADMAP.md](AGENT_ITERATION_ROADMAP.md)
 
 ---
 
@@ -54,7 +54,9 @@ agent_runtime/pipeline/
 
 ---
 
-### 2. MCP Tool Provider + Skill 分层（P1，Phase B）
+### 2. MCP Tool Provider + Skill 分层（P1，Phase B） — ✅ 2026-08-25 完成
+
+> 变更说明：[changes/2026-08-25-mcp-provider-skill-loader.md](changes/2026-08-25-mcp-provider-skill-loader.md)；配套手册：[SKILL_SYSTEM.md](SKILL_SYSTEM.md)。
 
 **现状**：`agent_runtime/tools.py` 的 `ToolRegistry` 静态注册 9 个工具，无动态注册、无 MCP 接入。Skill 文件化（优化师写 `.md` 扩展能力）在 7 月竞品调研里已设计但未实现。
 
@@ -62,26 +64,35 @@ agent_runtime/pipeline/
 - Tool 是 `ctx.tools` seam，可以有多个 Provider（内置、MCP、plugin）
 - Bundle/Patch 分层：工程师写底层 tool = base bundle，优化师写 `.md` skill = 上层 patch，不是动态注册新 tool
 
-**方案**：
+**方案（已落地，目录结构有微调）**：
 
 ```
-agent_runtime/tools/
-  ├── registry.py       # 现有 ToolRegistry，从 tools.py 迁出
-  ├── base.py           # AgentTool 抽象（现有）
-  ├── builtin/          # 现有 9 个内置工具
-  ├── mcp_provider.py   # 新增：MCP server → AgentTool 适配器
-  └── skill_loader.py   # 新增：skills/*.md → 工具参数/流程覆盖层
+agent_runtime/
+  ├── tools.py                  # 内置 13 工具（未拆分）；ToolRegistry 扩展 register/unregister/refresh_provider
+  ├── providers/
+  │   ├── base.py               # ToolProvider ABC（name + list_tools + close）
+  │   ├── static_provider.py    # 内存实现，测试 / 未来内置扩展
+  │   └── mcp_provider.py       # MCP streamable-http → Tool 适配器（httpx-only，无 SDK 依赖）
+  └── skills/
+      └── loader.py             # Skill / SkillStore：.md frontmatter → 默认参数 + system prompt 片段
 ```
 
-- **MCP Provider**：实现 BaseConnector 风格的接口，把外部 MCP server 的 tool schema 映射进 registry。先接 1 个跑通模式（建议 AppsFlyer MCP 或内部数据源），不要一次接十个。
-- **Skill Loader**：`.md` skill 不是注册新工具，是给已有 tool 提供参数化配置 + 提示词流程。例：优化师写 `scale_winning_campaign.md`，指定 `roi_threshold: 2.0`、`budget_increase_cap: 0.30`，执行时 skill body 作为 system prompt 片段指导 LLM 调用已有 `observe_campaigns` + `adjust_budget` 工具。
+- **MCP Provider**：基于 httpx 实现 JSON-RPC 最小子集（initialize → notifications/initialized → tools/list → tools/call），支持 `Mcp-Session-Id` 与 SSE 响应；工具以 `{provider}__{mcp_name}` 命名空间并入 registry；只读工具走 annotation + 名字前缀判定，写工具默认 L3（可在 `tool_risk` 配置降级）；连接失败 fail-soft 返回 `[]` 不拖垮 AgentLoop。
+- **Skill Loader**：`.md` skill 不注册新工具，只给 `target_tool` 合并默认参数（caller 显式参数优先）+ 把正文拼进 system prompt。示例 `scale_winning_campaign.md`、`pause_fatigued_adset.md` 已落 `backend/data/skills/`。
+- **AgentLoop 接线**：`__init__` 装载 SkillStore + 按 `settings.agent_mcp_servers` 注册 MCPProvider（幂等）；`_llm_decide` 追加 skill prompt 片段；`_dispatch` 所有路径统一 `skills.apply_params(tool.name, decision.params)`。
+- **配置**：`AGENT_MCP_ENABLED / AGENT_MCP_SERVERS / AGENT_SKILLS_ENABLED / AGENT_SKILLS_DIR`。
 
-**验收**：
-- 不重启服务可以加载/卸载一个 MCP server
-- 一个 `.md` skill 文件可以覆盖 StrategyStore 的默认参数
-- 文档：`docs/SKILL_SYSTEM.md`（新建）写清 skill front-matter 规范、与 tool 的边界
+**验收（实测）**：
+- 181 passed（155 → 181，新增 26：skill 10 + mcp 11 + provider-registry 5）
+- loop.py 437 → 476 行（仍 <500）
+- `ToolRegistry.register_provider / unregister_provider / refresh_providers` 支持运行时挂载/卸载/热刷新，不重启服务
+- `docs/SKILL_SYSTEM.md` 写清 frontmatter 规范、skill vs tool 边界、MCP 配置与安全缺省
 
-**不做**：不做 ClawHub 式的 skill 市场、不做 skill 热更新 UI——先文件系统扫描就够。
+**未做（刻意保留）**：
+- 不做 ClawHub 式的 skill 市场 / skill 与 MCP server 的 UI 管理（改文件 / 配置后重启，或调 `refresh_providers()` / `SkillStore.reload()`）。
+- 不引 `mcp` SDK、不实现 stdio / SSE transport / resources / prompts，等真有需要再补。
+- 不把 `effective_risk_level` 自动接进 AgentLoop，防止 skill 文件意外把 L2 写成 L0 绕过审批。
+- 未接真实第三方 MCP server（AppsFlyer 等）——SPI 与客户端就位，凭证 / 具体 endpoint 后续接。
 
 ---
 
@@ -180,10 +191,10 @@ README 顶部已加 Quick Start 段落，写清每条命令做了什么，并说
 | 1 | Tool Pipeline Middleware | P0 | 2-3 天 | ✅ 2026-08-25 完成 |
 | 5 | Makefile 启动 | P2 | 半天 | ✅ 2026-08-25 完成 |
 | 3 | AdSet/Ad 粒度 Connector | P1 | 3-4 天 | ✅ mock/sandbox 层 2026-08-25 完成（live 待接） |
-| 2 | MCP Provider + Skill Loader | P1 | 3-5 天 | ⏳ 待执行（#1） |
-| 4 | Durable Jobs | P2 | 2-3 天 | ⏳ 待执行（#1 后 job 触发逻辑更清晰） |
+| 2 | MCP Provider + Skill Loader | P1 | 3-5 天 | ✅ 2026-08-25 完成（httpx-only streamable-http；文件 skill） |
+| 4 | Durable Jobs | P2 | 2-3 天 | ⏳ 待执行（#1/#2/#3 后 job 触发逻辑更清晰） |
 
-**建议执行顺序**：~~#1 → #5（同日）~~ ✅ → #3 → #2 → #4。#1 是地基，不拆后面加什么都往 799 行 loop 里堆。
+**建议执行顺序**：~~#1 → #5（同日）~~ ✅ → ~~#3~~ ✅ → ~~#2~~ ✅ → #4。#1 是地基，不拆后面加什么都往 799 行 loop 里堆。
 
 ---
 

@@ -2,6 +2,7 @@
 
 > 较大的变更单独归档到 `docs/changes/`，这里只留一行索引，避免堆叠影响阅读。
 
+- 2026-08-25 — P1 #2：MCP Provider + Skill Loader（httpx-only MCP streamable-http，外部工具走同一条 middleware chain；`.md` frontmatter 形式 skill 给已有工具提供默认参数 + 流程提示；loop.py 476 行，181 测试全绿）。详见 [changes/2026-08-25-mcp-provider-skill-loader.md](changes/2026-08-25-mcp-provider-skill-loader.md) 与 [SKILL_SYSTEM.md](SKILL_SYSTEM.md)。
 - 2026-08-25 — P1 #3：AdSet/Ad 粒度 Connector + 工具（新增 observe_adsets/pause_adset/evaluate_creative，loop.py 未改仍 437 行，155 测试全绿）。详见 [changes/2026-08-25-adset-ad-granularity.md](changes/2026-08-25-adset-ad-granularity.md)。
 - 2026-08-25 — P0 升级：Tool Pipeline Middleware + Makefile（loop.py 799→437 行，新增 BudgetGuard，140 测试全绿）。详见 [changes/2026-08-25-tool-pipeline-middleware.md](changes/2026-08-25-tool-pipeline-middleware.md)。
 

@@ -37,11 +37,13 @@ v3 阶段既不接生产多媒体真实凭证，也不上 durable worker（Phase
 
 | 文件 | 职责 | 变更 |
 |------|------|------|
-| `loop.py` | **薄壳** ReAct 编排（437 行）：think→select tool→走 pipeline→observe；`approve` 过期/漂移委托 pipeline；LLM 决策（`_llm_decide`）原样保留 | v4 重构 |
+| `loop.py` | **薄壳** ReAct 编排（476 行）：think→select tool→走 pipeline→observe；`approve` 过期/漂移委托 pipeline；LLM 决策（`_llm_decide`）原样保留；启动时装载 SkillStore + 按配置注册 MCPProvider，dispatch 前合并 skill 参数 | v4 重构 / v4.2 接线 |
 | **`planner.py`** | 规则引擎兜底规划（纯函数）：暂停低 ROI / 高 ROI 加预算 / 换素材 / 出报告 + 解析函数 | v4 新增 |
 | **`pipeline/`** | Tool Pipeline Middleware 包（base/registry/risk_level/approval/executor/budget_guard） | v4 新增 |
+| **`providers/`** | ToolProvider SPI（base）+ StaticToolProvider + MCPProvider（httpx-only streamable-http）；外部工具以 `{provider}__{tool}` 命名空间并入 ToolRegistry，走同一条 middleware chain | v4.2 新增 |
+| **`skills/`** | Skill / SkillStore：`.md` frontmatter 加载器；提供 target_tool 默认参数 + system prompt 流程片段；不注册新工具 | v4.2 新增 |
 | `session.py` | AgentSession / Step / Store；response schema 携带 `execution_mode` / `account_id` / `verified_at` | 未变 |
-| `tools.py` | ToolRegistry + 13 工具（新增 `observe_adsets`/`pause_adset`/`evaluate_creative`，`adjust_bid` 修正为真正作用于 AdSet）；`_write` 通过 dispatcher 派发；`record_execution` 仍在本文件（被 pipeline/executor 复用） | v4.1 增补 |
+| `tools.py` | ToolRegistry + 13 工具（新增 `observe_adsets`/`pause_adset`/`evaluate_creative`，`adjust_bid` 修正为真正作用于 AdSet）；`_write` 通过 dispatcher 派发；`record_execution` 仍在本文件（被 pipeline/executor 复用）；v4.2 增加 `register/unregister/refresh_provider` | v4.1 / v4.2 增补 |
 | `memory.py` | Episode dataclass；`usable_episodes()` / `promote_usable_for_learning()` 门禁入口 | 未变 |
 | `reflection.py` | Reflector 摘要 | 未变 |
 | `strategy.py` | StrategyStore；`learn_from_memory` 只读 usable Episode | 未变 |
@@ -88,6 +90,17 @@ observe → decide (LLM 或 planner.rule_based_decide)
 **为什么审计不单独抽 middleware**：`tool.handler → Dispatcher → record_execution` 已写 IntentExecution + ActionLog + Episode 链接，再包一层 AuditLog middleware 会双写。未来加 PII/MCP 路由等纯横切逻辑时再评估。
 
 **已知遗留**：`autonomy.py::handle_anomaly` 主动巡检的写动作仍直调 `tool.handler`，未走 pipeline/BudgetGuard；同步 409 路径（`api/v1/agent.py::approve_step`）与 `loop.approve` 共用 `check_approval` 但未合并入口。
+
+### 2.2 MCP Provider + Skill 分层（v4.2 新增）
+
+外部能力通过两条正交的 seam 进入 Agent，**都不需要改 `loop.py`**：
+
+- **Provider（真工具）**：`providers/base.py::ToolProvider` 向 `ToolRegistry` 贡献 Tool；工具名必须以 `{provider.name}__` 开头。`MCPProvider` 用 httpx 实现 MCP streamable-http JSON-RPC 最小子集（`initialize → notifications/initialized → tools/list → tools/call`，支持 `Mcp-Session-Id` 与 SSE 响应）；只读判定走 `annotations.readOnlyHint` 或名字前缀（get/list/search/observe/evaluate/read/query/fetch/lookup），写工具默认 **L3**（仅建议），经 `tool_risk` 配置可降级。连接失败 fail-soft 返回 `[]`，AgentLoop 仍正常启动。
+- **Skill（参数 + 流程）**：`skills/loader.py::SkillStore` 扫描 `backend/data/skills/*.md` 的 YAML frontmatter（`name / target_tool / params / when / risk_level / enabled`），正文作为执行流程片段；`apply_params(tool, params)` 合并默认参数（caller 显式参数优先），`prompt_snippets()` 拼进 LLM system prompt。Skill **不注册工具、不改变风险分级事实源**（`effective_risk_level` 暴露了但 AgentLoop 不自动应用，防止 skill 文件绕过审批）。
+
+MCP 工具进入 registry 后与内置工具**走同一条 middleware chain**（BudgetGuard / 审批 / 审计 / dispatcher），这是 P0 抽 pipeline 的直接收益。运行时可用 `registry.register_provider / unregister_provider / refresh_providers` 挂载、卸载、热刷新。
+
+完整配置、frontmatter 规范、写自定义 Provider 的范本见 **[`SKILL_SYSTEM.md`](SKILL_SYSTEM.md)**。
 
 ---
 
@@ -343,7 +356,9 @@ a3e6a8c67106_phase4_3_episode_learning_gate     ← HEAD
 
 | 版本 | 日期 | 说明 |
 |------|------|------|
-| **v1.9.x** | 2026-08-25 | **Tool Pipeline Middleware（loop 薄壳化 799→437 行）+ BudgetGuard + planner.py + Makefile**；详见 [TOOL_PIPELINE_v1.md](TOOL_PIPELINE_v1.md) / [changes/2026-08-25-tool-pipeline-middleware.md](changes/2026-08-25-tool-pipeline-middleware.md) |
+| **v1.9.x** | 2026-08-25 | **MCP Provider + Skill Loader（v4.2）**：httpx-only MCP streamable-http，外部工具走同一条 middleware chain；`.md` frontmatter skill 给已有工具提供默认参数 + 流程提示；loop 476 行，181 测试。详见 [SKILL_SYSTEM.md](SKILL_SYSTEM.md) / [changes/2026-08-25-mcp-provider-skill-loader.md](changes/2026-08-25-mcp-provider-skill-loader.md) |
+| **v1.9.x** | 2026-08-25 | **AdSet/Ad 粒度 Connector（v4.1）**：模拟引擎 AdSet/Ad 层 + 3 新工具（observe_adsets/pause_adset/evaluate_creative），loop 未改，155 测试。详见 [changes/2026-08-25-adset-ad-granularity.md](changes/2026-08-25-adset-ad-granularity.md) |
+| **v1.9.x** | 2026-08-25 | **Tool Pipeline Middleware（v4.0，loop 薄壳化 799→437 行）+ BudgetGuard + planner.py + Makefile**；详见 [TOOL_PIPELINE_v1.md](TOOL_PIPELINE_v1.md) / [changes/2026-08-25-tool-pipeline-middleware.md](changes/2026-08-25-tool-pipeline-middleware.md) |
 | v1.8.x | 2026-07-22 | Phase 4.3 Episode 学习门禁（只学 usable 真实样本） |
 | v1.8.x | 2026-07-22 | Phase 4.2 延迟回采（observed / attributed 从事实表回填） |
 | v1.8.x | 2026-07-21 | Phase 4.1 三类影响拆分（predicted / observed / attributed） |

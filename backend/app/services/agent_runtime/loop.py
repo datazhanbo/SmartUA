@@ -61,6 +61,38 @@ class AgentLoop:
     def __init__(self):
         self.registry = get_tool_registry()
         self.chain = build_chain()
+        self.skills = self._load_skills()
+        self._register_configured_providers()
+
+    def _load_skills(self):
+        try:
+            from app.services.agent_runtime.skills import get_skill_store
+            return get_skill_store()
+        except Exception:
+            return None
+
+    def _register_configured_providers(self) -> None:
+        """根据 settings 注册 MCP 等外部 ToolProvider。幂等：同名 provider 已存在则跳过。"""
+        if not settings.agent_mcp_enabled:
+            return
+        existing = set(self.registry.provider_names())
+        try:
+            from app.services.agent_runtime.providers import MCPProvider
+        except Exception:
+            return
+        for spec in settings.agent_mcp_servers or []:
+            name = spec.get("name")
+            url = spec.get("url")
+            if not name or not url:
+                continue
+            if name in existing:
+                continue
+            self.registry.register_provider(MCPProvider(
+                name=name, url=url,
+                headers=spec.get("headers"),
+                timeout=float(spec.get("timeout", 15.0)),
+                tool_risk=spec.get("tool_risk") or {},
+            ))
 
     # ============================ 对外入口 ============================ #
     def start(self, session: AgentSession, ctx: AgentContext) -> AgentSession:
@@ -249,6 +281,9 @@ class AgentLoop:
             session.status = "done"
             return
 
+        params = (self.skills.apply_params(tool.name, decision.params)
+                  if self.skills is not None else (decision.params or {}))
+
         session.add_step(AgentStep(
             kind=AgentStepKind.THOUGHT.value,
             text=decision.thought or f"计划调用 {tool.name}",
@@ -256,21 +291,21 @@ class AgentLoop:
 
         # read 工具：直接执行
         if is_read_tool(tool):
-            call = self._build_call(tool, decision.params, ctx, trigger="read")
+            call = self._build_call(tool, params, ctx, trigger="read")
             self._execute_through_chain(call, session)
             return
 
         # L0 自动写：走 middleware chain（含 BudgetGuard）
         if is_l0_auto(tool):
             call = self._build_call(
-                tool, decision.params, ctx, trigger="l0",
-                predicted_impact=self._predict(ctx, tool.name, decision.params))
+                tool, params, ctx, trigger="l0",
+                predicted_impact=self._predict(ctx, tool.name, params))
             self._execute_through_chain(call, session)
             return
 
         # L1/L2/L3 → 先过 BudgetGuard，通过则冻结快照转人在环
         if needs_approval(tool):
-            call = self._build_call(tool, decision.params, ctx, trigger="proposed")
+            call = self._build_call(tool, params, ctx, trigger="proposed")
             for mw in self.chain:
                 short = mw.before(call)
                 if short is not None and short.status == "denied":
@@ -280,12 +315,12 @@ class AgentLoop:
                         status=AgentStepStatus.DONE.value))
                     return
 
-            pred = self._predict(ctx, tool.name, decision.params)
-            fz = freeze_snapshot(ctx, decision.params)
+            pred = self._predict(ctx, tool.name, params)
+            fz = freeze_snapshot(ctx, params)
             session.add_step(AgentStep(
                 kind=AgentStepKind.APPROVAL.value,
-                text=f"提议{tool.name}：{_propose_text(tool, decision.params)}",
-                tool=tool.name, params=decision.params, risk_level=tool.risk_level,
+                text=f"提议{tool.name}：{_propose_text(tool, params)}",
+                tool=tool.name, params=params, risk_level=tool.risk_level,
                 predicted_impact=pred, status=AgentStepStatus.PROPOSED.value,
                 expires_at=fz["expires_at"], snapshot=fz["snapshot"],
                 result={"provenance": provenance_of(ctx)}))
@@ -293,7 +328,7 @@ class AgentLoop:
             return
 
         # 兜底：未知 risk_level 当作只读处理
-        res = tool.handler(decision.params, ctx)
+        res = tool.handler(params, ctx)
         session.add_step(AgentStep(
             kind=AgentStepKind.OBSERVATION.value, text=res.observation,
             tool=tool.name, result=res.data, status=AgentStepStatus.DONE.value))
@@ -349,6 +384,10 @@ class AgentLoop:
             "再结合返回的行业标准给出判断。\n"
             "若需要了解账户现状，调用 observe_campaigns。"
         )
+        if self.skills is not None:
+            skill_block = self.skills.prompt_snippets()
+            if skill_block:
+                sys_prompt += "\n\n" + skill_block
         messages = [{"role": "system", "content": sys_prompt}]
         if history:
             messages.append({"role": "user", "content": "已发生：\n" + "\n".join(history)})
