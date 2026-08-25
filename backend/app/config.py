@@ -92,6 +92,11 @@ class Settings(BaseSettings):
     # 相对提案快照的相对变化超过此比例，或 status 直接变化，则废弃旧动作、重新规划。
     agent_approval_drift_pct: float = 0.20
 
+    # ===== Tool Pipeline 预算护栏（Middleware） =====
+    # 写动作 daily_budget 的相对增幅上限：超过则 BudgetGuard 在审批/执行前短路。
+    agent_budget_guard_enabled: bool = True
+    agent_budget_max_increase_pct: float = 0.50
+
     # ===== Phase 2.2 SSE 认证 =====
     # SSE stream-ticket 生存期（秒）：短期 + 单次 + 绑定 (user, session)。
     agent_sse_ticket_ttl_seconds: int = 60

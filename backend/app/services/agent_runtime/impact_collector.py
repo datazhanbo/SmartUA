@@ -83,23 +83,26 @@ def enqueue_after_verified(db: Session, action: AgentActionDB,
 
 
 def due_jobs(db: Session, now: Optional[datetime] = None,
-             limit: int = 200) -> List[AgentImpactJobDB]:
-    """挑出到点的、还没执行完的 job。"""
+             limit: int = 200,
+             app_id: Optional[int] = None) -> List[AgentImpactJobDB]:
+    """挑出到点的、还没执行完的 job。可选按 app_id 过滤（Phase 2.1 边界）。"""
     now = now or datetime.utcnow()
-    return (db.query(AgentImpactJobDB)
-              .filter(AgentImpactJobDB.status == "scheduled",
-                      AgentImpactJobDB.scheduled_at <= now)
-              .order_by(AgentImpactJobDB.scheduled_at.asc())
-              .limit(limit)
-              .all())
+    q = db.query(AgentImpactJobDB).filter(
+        AgentImpactJobDB.status == "scheduled",
+        AgentImpactJobDB.scheduled_at <= now,
+    )
+    if app_id is not None:
+        q = q.filter(AgentImpactJobDB.app_id == app_id)
+    return q.order_by(AgentImpactJobDB.scheduled_at.asc()).limit(limit).all()
 
 
 def run_due_jobs(db: Session, now: Optional[datetime] = None,
-                 limit: int = 200) -> Dict[str, int]:
-    """跑一遍所有到点的 job，返回统计：{done, empty, failed}。"""
+                 limit: int = 200,
+                 app_id: Optional[int] = None) -> Dict[str, int]:
+    """跑一遍所有到点的 job，返回统计：{done, empty, failed}。app_id 过滤同 due_jobs。"""
     now = now or datetime.utcnow()
     stats = {"done": 0, "empty": 0, "failed": 0}
-    for job in due_jobs(db, now=now, limit=limit):
+    for job in due_jobs(db, now=now, limit=limit, app_id=app_id):
         action = db.query(AgentActionDB).filter(AgentActionDB.id == job.action_id).first()
         if action is None:
             job.status = "failed"
@@ -129,8 +132,49 @@ def run_due_jobs(db: Session, now: Optional[datetime] = None,
         job.status = "done"
         job.executed_at = now
         db.flush()
+        # Phase 4.3 —— 回填到 Episode（若存在关联）并按门禁提权 usable_for_learning
+        if has_data:
+            _promote_episode(db, action.id, kind=job.kind,
+                             window=job.window, envelope=envelope)
         stats["done" if has_data else "empty"] += 1
     return stats
+
+
+def _promote_episode(db: Session, action_id: str, *, kind: str,
+                     window: str, envelope: Dict[str, Any]) -> None:
+    """把回采到的真实 envelope 写回 Episode.impact，并按门禁把 usable_for_learning 置为 True。
+
+    - impact 挂到 `impact_{window}` 键（与 tools._compute_impact 落的 predicted 同键覆盖）；
+    - execution_mode != "live" 或 completeness == 0 → 不提权，只更新 data_quality；
+    - 一个 action 通常对应 1 条 Episode；对齐多条时全部同步。
+    - 单独失败不阻塞主 collector 流程。
+    """
+    try:
+        from app.models.agent_runtime import EpisodeDB
+        rows = db.query(EpisodeDB).filter(EpisodeDB.action_id == action_id).all()
+        if not rows:
+            return
+        completeness = float(envelope.get("completeness") or 0.0)
+        for r in rows:
+            impact = dict(r.impact_json or {})
+            impact[f"impact_{window}"] = envelope
+            dq = dict(r.data_quality_json or {})
+            dq["impact_kind"] = kind
+            dq["completeness"] = completeness
+            sources = list(dq.get("sources") or [])
+            src = envelope.get("source")
+            if src and src not in sources:
+                sources.append(src)
+            dq["sources"] = sources
+            r.impact_json = impact
+            r.data_quality_json = dq
+            if (r.execution_mode == "live"
+                    and completeness > 0
+                    and kind in ("observed", "attributed")):
+                r.usable_for_learning = True
+        db.flush()
+    except Exception:
+        logger.exception("promote episode after collect failed for action %s", action_id)
 
 
 def _collect_one(db: Session, action: AgentActionDB,

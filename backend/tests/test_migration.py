@@ -9,7 +9,7 @@ from sqlalchemy.orm import sessionmaker
 # They do not import from conftest.py to avoid the in-memory override.
 
 _KNOWN_TABLES = 35  # Baseline (33) + phase3.1 agent_actions + phase4.2 agent_impact_jobs
-_HEAD_REVISION = "6aff1c23d194"  # phase4.2 add agent_impact_jobs
+_HEAD_REVISION = "a3e6a8c67106"  # phase4.3 episode learning gate
 
 
 @pytest.fixture

@@ -28,7 +28,7 @@
 | 1 | 真实与模拟严格隔离 | ✅ 已完成 | 1.1 ✅ · 1.2 ✅ |
 | 2 | 对象授权与会话安全 | ✅ 已完成 | 2.1 ✅ · 2.2 ✅ |
 | 3 | 安全动作闭环 | 进行中 | 3.1 ✅ · 3.2 ✅ · 3.3 ✅ |
-| 4 | 真实影响与学习质量 | 进行中 | 4.1 ✅ · 4.2 ✅ |
+| 4 | 真实影响与学习质量 | 进行中 | 4.1 ✅ · 4.2 ✅ · 4.3 ✅ |
 | 5 | 持久运行时与多实例协调 | 待开始 | — |
 | 6 | 有限扩充只读能力 | 待开始 | — |
 | 7 | 策略治理与知识库 | 待开始 | — |
@@ -414,11 +414,29 @@
 - StrategyStore 只读取满足门槛的真实 Episode。
 - Mock Episode 保留用于开发评估，但与生产策略完全隔离。
 
-**关键文件：** `backend/app/services/agent_runtime/memory.py`、`backend/app/services/agent_runtime/strategy.py`、`backend/app/models/agent_runtime.py`
+**关键文件：** `backend/app/services/agent_runtime/memory.py`、`backend/app/services/agent_runtime/strategy.py`、`backend/app/models/agent_runtime.py`、`backend/app/services/agent_runtime/impact_collector.py`、`backend/app/services/agent_runtime/loop.py`、`backend/app/services/agent_runtime/tools.py`、`backend/alembic/versions/a3e6a8c67106_phase4_3_episode_learning_gate.py`
 
 **验收：** 仅有 Mock Episode 时 learn 返回"无可用真实样本"且策略不变。
 
-**状态：** ⬜ 待开始 | **依赖：** 4.2 | **下一步：** Episode 增加 data_quality 字段
+**状态：** ✅ 已完成（2026-07-22） | **依赖：** 4.2 | **下一步：** Phase 5.x durable runtime / 5.1 PostgreSQL 迁移
+
+**验收结果：**
+- 新增 5 列到 `agent_episodes`：`execution_mode` / `data_quality_json` / `usable_for_learning` / `evidence_action_ids_json` / `action_id`（外键 → `agent_actions.id`）。Alembic 迁移 `a3e6a8c67106`，`down_revision='6aff1c23d194'`。
+- `memory.Episode` dataclass 携带同名字段；`EpisodicMemory.record()` / `_row_to_ep` 双向同步；新增 `usable_episodes()` 与 `promote_usable_for_learning()`。
+- `tools._write` 记录 Episode 时写入 `execution_mode`（来自 connector）+ `data_quality={impact_kind:"predicted", …}`，`usable_for_learning=False`（默认不可学习）。
+- `loop._link_episode_to_action`：dispatcher `verified/failed/unknown` 之后把最新一条 Episode 的 `action_id` / `evidence_action_ids` 补上，形成 Episode ↔ AgentActionDB 的可追溯软链接。
+- `impact_collector._promote_episode`：`run_due_jobs` 拿到真实 observed/attributed envelope 后把对应 Episode 的 `impact.impact_{window}` 覆盖、`data_quality` 更新为最新采集结果，并按门禁（`execution_mode=="live" ∧ completeness>0 ∧ kind∈{observed,attributed}`）把 `usable_for_learning` 置为 True。Mock/Sandbox 或 completeness=0 → 只更新 data_quality，不提权。
+- `StrategyStore.learn_from_memory`：入口先取 `memory.usable_episodes()`，无可用样本时**完全不动 `_rules`**并返回 `note="无可用真实样本：仅有 Mock/Sandbox 或 predicted-only Episode，策略保持不变。"`；有样本时 note 前置 `[usable=N 条真实样本]`。
+- 新增测试文件 `tests/test_episode_learning_gate.py`（6 用例）：mock-only → strategy 不变；live+usable → 学习并报告样本数；collector 提权 live episode；collector 不提权 mock episode；空回采不提权；新字段跨 `SessionLocal` 持久回读一致。
+- 迁移测试 `_HEAD_REVISION` 更新为 `a3e6a8c67106`；全套 129 tests passing（4.2 基线 123 + 4.3 新增 6）。
+
+**外部依赖阻塞：** 无。真实 live Episode 提权路径依赖 Phase 4.2 已落地的 `run_due_jobs`；本步骤只补消费端 + 学习门禁。生产上要跑通"live 提权"，需要 4.2 的调度器（Phase 5.2 durable worker）真正跑起来。
+
+**遗留风险：**
+- `evidence_action_ids_json` 目前只在 dispatcher `_link_episode_to_action` 时写入一条动作 id；跨动作的复合 Episode（例如"暂停+加预算"组合执行）暂未合并 evidence，等 Phase 5.1 / 6.x 引入更细的 Episode 语义时再扩展。
+- `promote_usable_for_learning` 与 `_promote_episode` 目前**只在 collector 内**写 Episode，不同步 IntentExecution 的 observed/attributed 字段 —— 与 4.2 遗留一致，等 4.3.x 或 6.x 反哺 IntentExecution 时统一收敛。
+- `StrategyStore.learn_from_memory` 仍是"日均粗聚合"，没有对 attribution 完整性 / 样本方差做置信度加权 —— Phase 7 策略治理会再细化。
+- `EpisodicMemory.aggregate()` 仍读所有 Episode（含 mock），供 Reflection 摘要复盘用；只有 StrategyStore 强制走 `usable_episodes()`。Reflection 展示的 "avg_delta_roi_7d" 因此可能既含 predicted 又含 observed，UI 层需要清晰区分（现有 `data_quality.impact_kind` 已经带上，前端 Phase 6/7 再展示）。
 
 ---
 

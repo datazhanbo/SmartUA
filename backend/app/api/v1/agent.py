@@ -371,6 +371,30 @@ def approve_step(
             except Exception:
                 pass
 
+        # Phase 3.2 —— 状态漂移 fail-fast：批准瞬间重读实体，超过阈值直接 409。
+        # 前端凭 detail.drift 说明与 snapshot/current 对比，重新提案。
+        if step.snapshot and step.params and step.params.get("entity_id"):
+            try:
+                from app.services.agent_runtime.loop import _detect_drift, _summary_of
+                ctx = _make_ctx(db, current_user, session.app_id)
+                current = _summary_of(ctx, step.params.get("entity_id"))
+                drift = _detect_drift(step.snapshot, current,
+                                       settings.agent_approval_drift_pct)
+                if drift:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={"error": "state_drifted",
+                                "drift": drift,
+                                "snapshot": step.snapshot,
+                                "current": current,
+                                "message": "审批期间实体状态发生漂移，请重新触发规划"})
+            except HTTPException:
+                raise
+            except Exception:
+                # 漂移检测失败不应阻塞审批（例如 connector 暂时不可达）；
+                # Loop 内部还会再校验一次，保底不放行漂移动作。
+                pass
+
     # 若是主动自治生成的提案，回写关联告警状态（前端告警流随之更新）
     try:
         update_alert_for_session(
@@ -508,6 +532,111 @@ def reset_strategy(
     """清空已学策略（重置为硬编码默认）。"""
     get_strategy().reset()
     return {"ok": True, "detail": "策略已重置为硬编码默认值"}
+
+
+# ----------------------------- Phase 3.3 / 4.2：对账 & 回采 ----------------------------- #
+class ReconcileRequest(BaseModel):
+    app_id: int
+    max_actions: int = 200
+
+
+@router.post("/actions/reconcile")
+def reconcile_actions(
+    req: ReconcileRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Phase 3.3 —— 把 `unknown` 状态的动作再拉一次媒体状态回读，看能否收敛到 verified/failed。
+
+    - 只处理 req.app_id 范围内、当前 state='unknown' 的动作。
+    - 依赖 connector.read_state；对无 entity_id 或 read_state 不可用的动作直接跳过并计入 still_unknown。
+    """
+    require_app_access(current_user, req.app_id, db)
+    from app.models.agent_runtime import AgentActionDB
+    from app.services.agent_runtime.action_store import ActionRequest
+    from app.services.agent_runtime.dispatcher import get_dispatcher
+    from app.services.connectors import ConnectorFactory, resolve_credentials
+
+    rows = (db.query(AgentActionDB)
+              .filter(AgentActionDB.app_id == req.app_id,
+                      AgentActionDB.state == "unknown")
+              .order_by(AgentActionDB.dispatched_at.asc())
+              .limit(max(1, min(int(req.max_actions or 200), 1000)))
+              .all())
+
+    dispatcher = get_dispatcher()
+    connector_cache = {}
+    stats = {"scanned": len(rows), "verified": 0, "failed": 0, "still_unknown": 0}
+
+    for row in rows:
+        platform = row.platform or settings.agent_default_platform
+        if platform not in connector_cache:
+            try:
+                connector_cache[platform] = ConnectorFactory.get_connector(
+                    platform, db=db, app_id=req.app_id,
+                    credentials=resolve_credentials(platform, db=db, app_id=req.app_id),
+                    execution_mode=row.execution_mode or settings.agent_execution_mode)
+            except Exception:
+                connector_cache[platform] = None
+        connector = connector_cache.get(platform)
+        read_state = getattr(connector, "read_state", None) if connector else None
+        if read_state is None or not row.entity_id:
+            stats["still_unknown"] += 1
+            continue
+
+        action_req = ActionRequest(
+            session_id=row.session_id, step_id=row.step_id, app_id=row.app_id,
+            user_id=row.user_id, tool=row.tool, action=row.action,
+            entity_id=row.entity_id, platform=row.platform, account_id=row.account_id,
+            execution_mode=row.execution_mode, risk_level=row.risk_level,
+            request=row.request_json or {}, pre_state=row.pre_state_json,
+            predicted_impact=row.predicted_impact_json)
+        try:
+            outcome = dispatcher.reconcile(db, row, action_req, read_state=read_state)
+        except Exception:
+            stats["still_unknown"] += 1
+            continue
+
+        if outcome.state == "verified":
+            stats["verified"] += 1
+        elif outcome.state == "failed":
+            stats["failed"] += 1
+        else:
+            stats["still_unknown"] += 1
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+    return stats
+
+
+class ImpactCollectRequest(BaseModel):
+    app_id: int
+    limit: int = 200
+
+
+@router.post("/impact/collect")
+def impact_collect(
+    req: ImpactCollectRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Phase 4.2 —— 触发一次 `run_due_jobs`，把到点 impact job 从事实表回采。
+
+    - 只回采 req.app_id 范围内的 job（通过 AgentImpactJobDB.app_id 过滤，见 collector 实现）。
+    - 生产建议由外部调度器（APScheduler / cron）周期调用；本端点主要用于运维手动触发与验收。
+    """
+    require_app_access(current_user, req.app_id, db)
+    from app.services.agent_runtime.impact_collector import run_due_jobs
+    from datetime import datetime as _dt
+
+    limit = max(1, min(int(req.limit or 200), 1000))
+    stats = run_due_jobs(db, now=_dt.utcnow(), limit=limit, app_id=req.app_id)
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+    return {**stats, "scanned": stats["done"] + stats["empty"] + stats["failed"]}
 
 
 # ----------------------------- Phase 4：主动式自治端点 ----------------------------- #

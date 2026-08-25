@@ -63,6 +63,18 @@ class Episode:
     impact: Dict[str, Any] = field(default_factory=dict)      # impact_2h/24h/7d
     outcome: bool = True
     note: str = ""
+    # Phase 4.3 — 学习门禁 -----------------------------------------------
+    # execution_mode: 'mock' / 'sandbox' / 'live' —— Mock/Sandbox 永不进策略学习。
+    # data_quality: {impact_kind, execution_mode, completeness, sources}
+    # usable_for_learning: 是否可作为策略学习样本（默认 False，回采到真实 observed/attributed
+    #   数据后由 promote_usable_for_learning 提权为 True）。
+    # evidence_action_ids: 关联证据（AgentActionDB.id），供 Reflection 点回原始动作。
+    # action_id: 对应的动作 id（1-1，由 dispatcher outcome 回填）。
+    execution_mode: Optional[str] = None
+    data_quality: Dict[str, Any] = field(default_factory=dict)
+    usable_for_learning: bool = False
+    evidence_action_ids: List[str] = field(default_factory=list)
+    action_id: Optional[str] = None
 
     # --- 便捷取值（供聚合/反思） ---
     # Phase 4.1 起：impact_24h/7d 都是 predicted envelope（{kind, metrics, window, ...}）；
@@ -138,6 +150,11 @@ class EpisodicMemory:
             impact=r.impact_json or {},
             outcome=bool(r.outcome) if r.outcome is not None else True,
             note=r.note or "",
+            execution_mode=r.execution_mode,
+            data_quality=r.data_quality_json or {},
+            usable_for_learning=bool(r.usable_for_learning) if r.usable_for_learning is not None else False,
+            evidence_action_ids=list(r.evidence_action_ids_json or []),
+            action_id=r.action_id,
         )
 
     def record(self, ep: Episode) -> Episode:
@@ -158,6 +175,11 @@ class EpisodicMemory:
                 impact_json=ep.impact,
                 outcome=ep.outcome,
                 note=ep.note,
+                execution_mode=ep.execution_mode,
+                data_quality_json=ep.data_quality or None,
+                usable_for_learning=ep.usable_for_learning,
+                evidence_action_ids_json=ep.evidence_action_ids or None,
+                action_id=ep.action_id,
             ))
             db.commit()
         finally:
@@ -178,6 +200,57 @@ class EpisodicMemory:
 
     def has_experience(self, action: str) -> bool:
         return len(self.by_action(action)) > 0
+
+    # ----------------------------------------------------------------- #
+    # Phase 4.3 —— 学习门禁：只挑真实、可用的样本
+    # ----------------------------------------------------------------- #
+    def usable_episodes(self) -> List[Episode]:
+        """返回 usable_for_learning=True 的 Episode（策略学习的唯一入口）。"""
+        self._ensure_loaded()
+        return [e for e in self._eps if e.usable_for_learning]
+
+    def promote_usable_for_learning(self, action_id: str,
+                                     impact_kind: str,
+                                     window_key: str,
+                                     envelope: Dict[str, Any]) -> int:
+        """回采到真实 observed/attributed 数据时，把对应 Episode 的：
+        - impact[window_key] 更新为该 envelope
+        - data_quality 更新为最新观察结果
+        - usable_for_learning 置为 True（仅当 execution_mode=='live' 且 completeness>0）
+
+        返回被更新的 Episode 条数（一个动作可能对应多条 Episode，通常只有 1 条）。
+        """
+        self._ensure_loaded()
+        completeness = float(envelope.get("completeness") or 0.0)
+        db = SessionLocal()
+        n = 0
+        try:
+            rows = db.query(EpisodeDB).filter(EpisodeDB.action_id == action_id).all()
+            for r in rows:
+                impact = dict(r.impact_json or {})
+                impact[window_key] = envelope
+                dq = dict(r.data_quality_json or {})
+                dq["impact_kind"] = impact_kind
+                dq["completeness"] = completeness
+                sources = dq.get("sources") or []
+                src = envelope.get("source")
+                if src and src not in sources:
+                    sources.append(src)
+                dq["sources"] = sources
+                r.impact_json = impact
+                r.data_quality_json = dq
+                # 只有真实 live 动作 + 有效数据可以被提权
+                if r.execution_mode == "live" and completeness > 0 and impact_kind in ("observed", "attributed"):
+                    r.usable_for_learning = True
+                n += 1
+            db.commit()
+        finally:
+            db.close()
+        # 顶级缓存也刷新
+        if n > 0:
+            self._loaded = False
+            self._ensure_loaded()
+        return n
 
     # ----------------------------------------------------------------- #
     # 聚合统计：反思与规划的基础

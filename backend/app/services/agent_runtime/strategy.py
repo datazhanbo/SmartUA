@@ -83,7 +83,25 @@ class StrategyStore:
     # 学习：从 Episode 记忆挖掘策略参数
     # ----------------------------------------------------------------- #
     def learn_from_memory(self, memory, min_samples: int = 1) -> StrategyLearnResult:
-        eps = memory.all()
+        """Phase 4.3 —— 只从 usable_for_learning=True 的 Episode 学习。
+
+        样本门禁：Episode 必须
+        (1) execution_mode == "live"（Mock/Sandbox 永不进策略）；
+        (2) data_quality.impact_kind ∈ {observed, attributed}（predicted 只是模型猜测，不算真凭据）；
+        (3) completeness > 0（延迟回采到过真实数据）。
+        以上三条由 EpisodicMemory.promote_usable_for_learning 在回采完成后统一提权。
+
+        若没有可用样本 → 不修改任何策略，返回明确的 note 说明。
+        """
+        usable_getter = getattr(memory, "usable_episodes", None)
+        eps = usable_getter() if callable(usable_getter) else [
+            e for e in memory.all() if getattr(e, "usable_for_learning", False)
+        ]
+        if not eps:
+            return StrategyLearnResult(
+                dict(self._rules), [],
+                "无可用真实样本：仅有 Mock/Sandbox 或 predicted-only Episode，策略保持不变。"
+            )
         learned: Dict[str, StrategyRule] = {}
         notes: List[str] = []
 
@@ -136,7 +154,9 @@ class StrategyStore:
         for k, r in learned.items():
             self._rules[k] = r
         self._save()
-        return StrategyLearnResult(self._rules, list(learned.keys()), "；".join(notes) or "无新学习")
+        head = f"[usable={len(eps)} 条真实样本] "
+        joined = "；".join(notes) or "无新学习"
+        return StrategyLearnResult(self._rules, list(learned.keys()), head + joined)
 
     # ----------------------------------------------------------------- #
     # 持久化（落盘，跨进程迁移）

@@ -64,6 +64,24 @@ class EpisodeDB(Base):
     impact_json = Column(JSON)
     outcome = Column(Boolean, default=True)
     note = Column(Text)
+    # Phase 4.3 —— Episode 学习门禁 -----------------------------------------
+    # execution_mode: 记录动作真实执行环境（mock / sandbox / live）。
+    #   Mock/Sandbox Episode 永远不能反哺生产策略。
+    # data_quality: 结构化数据来源，形如
+    #   {"impact_kind": "predicted|observed|attributed",
+    #    "execution_mode": "mock|sandbox|live",
+    #    "completeness": 0.0~1.0,
+    #    "sources": ["fact_media_daily", "appsflyer_mmp"]}
+    # usable_for_learning: 显式布尔门。默认 False，只有当
+    #   (execution_mode == "live") ∧ (impact_kind ∈ {observed, attributed})
+    #   ∧ (completeness > 0) 时由回采任务提权为 True。
+    # evidence_action_ids: 关联的 AgentActionDB.id 列表；反思和策略调整必须能"点到"证据。
+    # action_id: 单条 Episode 对应的动作（1-1；一个 Episode 由一个动作产出）。
+    execution_mode = Column(String(16), nullable=True, index=True)
+    data_quality_json = Column(JSON, nullable=True)
+    usable_for_learning = Column(Boolean, default=False, index=True)
+    evidence_action_ids_json = Column(JSON, nullable=True)
+    action_id = Column(String(32), ForeignKey("agent_actions.id"), nullable=True, index=True)
 
 
 class AutonomyAlertDB(Base):

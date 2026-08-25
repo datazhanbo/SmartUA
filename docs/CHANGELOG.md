@@ -1,5 +1,160 @@
 # 更新日志
 
+> 较大的变更单独归档到 `docs/changes/`，这里只留一行索引，避免堆叠影响阅读。
+
+- 2026-08-25 — P0 升级：Tool Pipeline Middleware + Makefile（loop.py 799→437 行，新增 BudgetGuard，140 测试全绿）。详见 [changes/2026-08-25-tool-pipeline-middleware.md](changes/2026-08-25-tool-pipeline-middleware.md)。
+
+---
+
+## 未发布 - 2026-07-22 — 前端 v3 UI 落地：三档影响 / 审批倒计时 / 漂移 409 / 派发状态 / 学习门禁语义
+
+### Added（新增）
+
+- `AgentConsole.jsx::EXEC_MODE_META`：Mock 徽标从灰色（default）改为黄色（gold），tip 显式提醒"策略学习门禁会拒绝 mock 样本"。与 `USER_MANUAL_v3.md` 徽标规范（Mock 黄 / Sandbox 蓝 / Live 红）对齐。
+- `AgentConsole.jsx::useCountdown` + 审批 Card 倒计时：读取 `step.expires_at`，每秒刷新剩余秒数；`< 60s` 转橙，过期转红并禁用"批准执行"按钮（文案切换为"已过期不可执行"）。防止用户在过期审批上继续点批准触发后端 409。
+- `AgentConsole.jsx::handleApprove` 409 结构化处理：区分 `approval_expired`（"请重新触发提案后再审批"）与 `state_drifted`（把 `drift` 字典渲染为 `字段: from→to` 变更列表），冲突后强制 `getSession` 刷新，让 UI 立刻反映后端最新状态。原本 `message.error(detail)` 遇到 dict 会渲染 `[object Object]`。
+- `AgentConsole.jsx::DISPATCH_STATE_META` + StepView action 分支：读取 `step.result.dispatch.{state, action_id, observation}`，在动作卡片上显式渲染派发状态徽标（✅ 已核验 / ❌ 派发失败 / ⏳ 状态待对账 / 📤 已提交 / 📤 派发中），并附短 action_id 便于对账日志检索。tooltip 展示 dispatcher observation。
+- `AgentConsole.jsx::ImpactView` 三档影响重写：读取 `step.result.impact.{impact_2h, impact_24h, impact_7d}`（每个是 ImpactEnvelope），每档独立展示 `kind`（predicted 蓝 / observed 绿 / attributed 紫）、`window`、`completeness`、`source`、`metrics`。observed/attributed 的 `completeness=0/null` 显式渲染"暂无数据"而非 0 冒充有效果。旧 flat `delta_*` 结构保留兼容分支。
+- `AgentConsole.jsx::handleLearn` 学习门禁语义：解析后端返回 note 里的 `[usable=N 条真实样本]` 前缀，`N=0` 用 `message.info` 明确提示"只有 execution_mode=live 且 observed/attributed 回采完成的 Episode 才能训练策略；当前策略保持不变"；`N>0` 展示样本数 + 具体学习内容。原本 `message.success(note)` 会把"无可用真实样本"当成学习成功。
+
+### Rationale（设计原因）
+
+- **为什么倒计时要禁用按钮而不是提示后再让用户点**：后端已 fail-fast 返回 409，但一次冒烟点击会白白触发后端漂移检测（重读实体状态、重建 Connector），前端就地禁用更省链路。
+- **为什么 drift 详情要直接在 message 里展示而不是弹 Modal**：漂移常见于账户预算被同事改动，用户看到 `daily_budget: 100→50` 就能自己判断是否重提，Modal 反而打断节奏。
+- **为什么 completeness=0 的 observed/attributed 要显式"暂无数据"**：Phase 4.1 不变量——没有观察到就是没有观察到；如果和"observed 但 delta=0"同色显示，用户会误以为动作没效果，进而做错决策。
+- **为什么学习门禁的语义要在 UI 层反解 note**：后端 note 是自然语言（`strategy.py::head + notes`），API 返回体没有单独的 `usable_count` 字段；如果为 UI 单开一个字段会让 API 契约膨胀，反解在 UI 层短期成本更低。后续 v3.1 API 稳定后再扁平化到 `{usable: N, rules_updated: [...]}`。
+
+### Validation（验证）
+
+- `cd frontend && npm run build`：3653 modules transformed，产物 `dist/assets/index-*.js` 2.46 MB（gzip 793 KB），无 syntax / import 错误；未新增依赖。
+- 未跑 e2e：Playwright / Cypress 未在项目中；下一轮 Phase 0.1 基线里再补冒烟脚本。手动 QA 建议：跑一次 `/scripts/demo_phase4.py`，然后用浏览器在 http://localhost:5173 走一遍"目标 → 审批（等 5min 后过期）→ 拒绝 → 重新提案 → 批准 → 派发 → 回采触发"。
+
+### 已知遗留
+
+- 前端 `handleApprove` 冲突后调用 `getSession` 拉全量步骤，SSE 通道其实会自然收敛；两者共存在极端并发时可能双写 `session` state。等 Phase 5.2 durable worker 上线、`GET /session` 与 SSE 完全同源后再简化。
+- `ImpactView` 目前只显示三档 envelope，`kind==="predicted"` 一定会有（simulate_impact 出），但 v3 契约允许 predicted envelope 缺席（例如纯读操作）；此时组件返回 null，动作卡片就没有 impact 区块。这是符合 Phase 4.1 语义的：没预测就不假装有。
+
+---
+
+## 未发布 - 2026-07-22 — 后端补齐 v3 API 契约：reconcile / impact-collect / 审批漂移 fail-fast
+
+### Added（新增）
+
+- `POST /api/v1/agent/actions/reconcile`：Phase 3.3 对账端点，把 `unknown` 状态动作再走一次 `connector.read_state` 回读，收敛为 `verified / failed / still_unknown`。`app_id` 授权 + `AgentActionDB.state=='unknown'` 边界；`max_actions` 上限 1000。
+- `POST /api/v1/agent/impact/collect`：Phase 4.2 手动触发 `run_due_jobs`，把到点 `AgentImpactJobDB` 从 `FactMediaDaily` / `FactMMPDaily` 回采到 `observed_impact_json` / `attributed_impact_json`。`app_id` 授权 + collector 侧新增 `app_id` 过滤参数，避免跨 app 漏采。
+- `POST /api/v1/agent/sessions/{id}/approve` 补齐同步漂移 fail-fast：批准瞬间重读实体状态，超过 `agent_approval_drift_pct` 直接 `409 {"error":"state_drifted","drift":..,"snapshot":..,"current":..}`，前端可立即重新提案。原 Loop 内异步 REJECTED 保留作为兜底。
+- `app/services/agent_runtime/impact_collector.py::due_jobs / run_due_jobs` 新增 `app_id: Optional[int]` 过滤参数（默认 None 保留全局扫描语义）。
+
+### Rationale（设计原因）
+
+- **为什么手动触发端点也要保留**：生产由外部调度器（APScheduler / cron）周期调用 `run_due_jobs` / dispatcher.reconcile；但验收阶段和运维应急必须能显式触发，v3 API 契约已经承诺，代码不能落后。
+- **为什么漂移 409 在同步路径**：`API_REFERENCE_v3.md` 明确 `approval_expired` / `state_drifted` 都是 409 返回体，前端一次调用就要能拿到 drift 详情；如果只依赖 Loop 内的异步 REJECTED，前端要多轮询一次才能知道被驳回，UX 变差且日志错位。
+- **为什么 collector 加 app_id 参数而不是端点内先 count 再限 limit**：先 count 再 limit 存在 TOCTOU（另一进程可能同时消费 job）；把 `app_id` 直接下沉到查询是唯一正确的语义边界。
+
+### Validation（验证）
+
+- `python3 -c "from app.api.v1 import agent"`：路由 20 条全部注册，新增两条端点可见。
+- `inspect.signature(run_due_jobs)` / `due_jobs`：`app_id: Optional[int] = None` 落到默认参数末尾，向后兼容既有调用方（dispatcher.enqueue 后 collector 全局扫描不受影响）。
+- 未运行 pytest（Phase 0.1 基线 smoke 已在此前 checkpoint 报告为绿；本轮改动为端点新增 + 参数扩展，不改动 dispatcher 主流程）。
+
+### 已知遗留
+
+- `/agent/actions/reconcile` 与 `/agent/impact/collect` 目前只做 `require_app_access`，未额外强制 `admin` / `optimizer` 角色（`app/models/sys.py::UserAppBinding.role_id` 存在，但无 `has_role` 帮手函数）。v3 API 文档已把"admin only"标为契约；下一步在 `security.py` 加统一 `require_role` 后再收紧。
+- `agent.py::approve_step` 漂移检测复用了 `_make_ctx`，会重建一次 Connector；对 live 慢通道存在少量额外延迟。后续 Phase 5.1 走 async DB 时再复用 session-level connector 缓存。
+
+---
+
+## 未发布 - 2026-07-22 — 文档 checkpoint：v3 设计 / 架构 / 配置 / 使用文档就位
+
+### Added（新增）
+
+- `docs/ARCHITECTURE_v3.md`：基于 SmartUA v1.8.x 的架构 anchor 文档。覆盖 Agent Runtime v3 布局（新增 `action_store.py` / `dispatcher.py` / `impact.py` / `impact_collector.py`）、AgentActionDB 状态机（`proposed → approved → dispatching → accepted → verified | failed | unknown`）、execution_mode 契约、审批过期与漂移检测、幂等键、ImpactEnvelope 三类拆分、延迟回采窗口、Episode 学习门禁、Alembic 迁移链完整状态。
+- `docs/API_REFERENCE_v3.md`：向下兼容 v2 契约，补齐 v3 增量字段（`execution_mode` / `account_id` / `verified_at` / `dispatch: {state, action_id, observation}` / `predicted_impact` / `observed_impact` / `attributed_impact`）；新增端点 `POST /agent/sessions/{id}/stream-ticket` / `POST /agent/actions/reconcile` / `POST /agent/impact/collect`；`strategy/learn` 门禁化返回体（`[usable=N 条真实样本]` 前缀 vs "无可用真实样本"）；错误码扩充（409 approval_expired / state_drifted）。
+- `docs/CONNECTOR_DESIGN_v3.md`：三条 v3 契约（execution_mode 必填 / fail-closed live / read_state 回读）；Connector 布局矩阵（GoogleConnector fail-closed、MetaConnector 账户被封拒写、TikTokConnector 拒 live、MockMediaConnector 永固 mock）；`apply_action` 派发表；`impact_collector` 与 Connector 边界（回采只读事实表、不依赖 Connector 活性）；切 live 检查表。
+- `docs/USER_MANUAL_v3.md`：执行模式徽标（Mock 黄 / Sandbox 蓝 / Live 红）持续可见规则；审批过期倒计时 + 状态漂移提示；三档影响（预测 / 观察 / 归因）UI 呈现规则；策略学习门禁的用户语义（"跑 100 个 mock 动作不会改动生产规则"）；SSE 短票据浏览器无感；管理员配置对照表。
+- `docs/LLM_ROUTING_v3.md`：v3 强化的 LLM 边界（只提议不批准 / 不参与真实-模拟决策 / 不参与影响判定 / 不参与策略提权）；切 live 前的 data_sensitivity 检查项；无 LLM 时 v3 规则引擎路径通过 `strategy.advise` 继承 4.3 门禁。
+- `docs/RELATED_PROJECTS_v3.md`：新增数据库迁移（Alembic / Atlas）、幂等状态机 / Outbox（Temporal / dbos-transact / transactional-outbox）、事件驱动任务（arq / Celery / RQ / SAQ）、审计 / 合规（OpenLineage / DataHub / OpenTelemetry / Prometheus）四大方向的开源参考；SmartUA v3 阶段对照表更新。
+
+### Rationale（设计原因）
+
+- **为什么全部另起 v3 文件而不是覆盖 v2**：v1 / v2 已作为演进对照保留在 repo 里。生产升级路线（Phase 0.1 → 4.3）是"平台身份"级别的变化 —— 从"能跑 Agent 的原型"变为"具备承担真实预算的结构"。用新版本号新建文件既保留历史，也让读者能清楚看到"v2 → v3 的边界具体在哪里"。
+- **为什么六份文件同步交付**：v3 的核心特性（execution_mode / 幂等状态机 / 三类影响 / 学习门禁）横跨架构、API、连接器、用户界面、LLM 责任划分五个维度，任一份缺失都会让读者在其它文档里看到断言但找不到实现依据。同步交付才能构成一个自洽的文档集。
+- **为什么 v3 明确划分 LLM 的边界**：v2 的 LLM 是"更聪明的规划者"；v3 明确其不能改变 execution_mode / impact kind / usable_for_learning —— 生产升级的护栏必须由代码路径决定，不能由自然语言决定。
+- **为什么 CONNECTOR_DESIGN_v3 强调 collector 不依赖 Connector 活性**：这是 Phase 4.2 的关键设计边界。Connector 短时不可用不该阻断回采，反过来 Connector 拉不到数据时事实表也不该被假造 —— 两条独立通道各自失败各自恢复。
+
+### Validation（验证）
+
+- 六份 v3 文件生成：`ls docs/*_v3.md` 全部就位。
+- v2 / v1 文件未被修改：`git status docs/*_v2.md docs/*_v1.md` 无变更。
+- 交叉引用一致：每份 v3 底部脚注列出配套其余五份 v3 文档路径。
+- 版本号 / 日期 / 阶段对照统一：banner 全部标注 "v3 | 基于 2026-07-22 SmartUA v1.8.x"。
+
+### 已知遗留
+
+- CHANGELOG.md 本身未拆 v3 版本；沿用累积模式，等生产切 live 或 Phase 5.x 阶段达成后再打正式 tag。
+- 前端组件（AgentConsole.jsx / api.js）尚未按 v3 UI 契约更新执行模式徽标 / 三档影响并列展示；文档先行，代码 Phase 5.x 前后跟进。
+- v3 文档未涵盖运维手册（部署 / 备份 / 回滚 / 告警对接）；Phase 5.1 PostgreSQL 迁移前补齐。
+
+---
+
+## 未发布 - 2026-07-22 — 生产升级 Phase 4.3 Episode 学习门禁（策略只学真实 usable 样本）
+
+### Added（新增）
+
+- **`agent_episodes` 表新增 5 列（Alembic revision `a3e6a8c67106`，`down_revision='6aff1c23d194'`）**：
+  - `execution_mode` (String16, indexed)：`mock / sandbox / live`，记录动作真实执行环境。
+  - `data_quality_json` (JSON)：结构化数据来源 `{impact_kind, execution_mode, completeness, sources[]}`。
+  - `usable_for_learning` (Boolean, indexed, default False)：显式学习门 —— 只有满足门禁的 Episode 才被 StrategyStore 读取。
+  - `evidence_action_ids_json` (JSON)：关联的 AgentActionDB.id 列表；反思和策略调整可点回原始动作证据。
+  - `action_id` (String32, indexed, FK → `agent_actions.id`)：Episode ↔ 动作的 1-1 软链接。
+- **`memory.Episode` dataclass 新增同名字段**：`execution_mode / data_quality / usable_for_learning / evidence_action_ids / action_id`；`_row_to_ep` 与 `record()` 双向同步。
+- **`EpisodicMemory.usable_episodes()` / `promote_usable_for_learning()`**：新增两个入口。前者返回 `usable_for_learning=True` 的 Episode（StrategyStore 学习入口）；后者供 collector 完成回采后按门禁提权。
+- **`impact_collector._promote_episode(...)`**：`run_due_jobs` 在写回 AgentActionDB 之后同步回填 Episode。
+  - 更新 `impact.impact_{window}` 为真实 envelope、更新 `data_quality`（含新的 impact_kind / completeness / sources）。
+  - 门禁：`execution_mode == "live" ∧ completeness > 0 ∧ kind ∈ {observed, attributed}` → `usable_for_learning=True`；否则只更新 data_quality 不提权。
+- **`loop._link_episode_to_action(...)`**：dispatcher `verified / failed / unknown` 后把最近记录的同 tool / 同 session、`action_id` 为空的 Episode 补上 `action_id` 与 `evidence_action_ids`；单独失败不阻塞主流程（try/except 包裹）。
+- **`tools._write` 记录 Episode 时新增字段**：`execution_mode` 从 `ctx.connector.execution_mode` 读取；`data_quality = {impact_kind: "predicted", execution_mode, completeness: None, sources: ["simulate_impact/mock"]}`；`usable_for_learning=False`（默认永不参加学习，等回采提权）。
+- **`backend/tests/test_episode_learning_gate.py`**：6 项新用例。
+  - `test_learn_returns_no_usable_when_only_mock_episodes` —— 仅 Mock/Sandbox Episode → `learn_from_memory` 完全不动 `_rules`，note 明确返回"无可用真实样本"。
+  - `test_learn_uses_only_usable_live_episodes` —— 混合 mock + live-usable，只用 live 样本，head 含 `[usable=2 条真实样本]`。
+  - `test_collector_promotes_live_episode_to_usable` —— 真实 media 数据 → 关联的 live Episode 被提权，`data_quality.impact_kind ∈ {observed, attributed}`。
+  - `test_collector_does_not_promote_mock_episode` —— Mock Episode 即便回采到数据也不提权。
+  - `test_empty_collect_does_not_promote` —— completeness=0 不提权。
+  - `test_episode_dataclass_carries_new_fields` —— 跨 SessionLocal 持久回读一致。
+
+### Changed（变更）
+
+- **`StrategyStore.learn_from_memory`**：入口先取 `memory.usable_episodes()`。
+  - 无可用样本：**不动 `_rules`**，返回 `StrategyLearnResult(rules=当前rules, learned_keys=[], note="无可用真实样本：…")`。
+  - 有可用样本：note 前置 `[usable=N 条真实样本] `，其余聚合逻辑保持不变。
+- **`tests/test_migration.py`**：`_HEAD_REVISION` → `a3e6a8c67106`（`_KNOWN_TABLES` 仍为 35，本次只加列，未加表）。
+- **`app/models/agent_runtime.py`**：`EpisodeDB` 新增 5 列 + `action_id` FK。
+
+### Rationale（设计原因）
+
+- **为什么 execution_mode 加索引**：策略学习入口每次都要过滤 `execution_mode == "live"`，索引避免 Episode 表长起来后学习一次要全表扫描。
+- **为什么 `usable_for_learning` 默认 False 而不是"回采完成前根据 impact_kind 推断"**：显式布尔门禁比"每次查询都拼推断逻辑"更容易审计。回采路径唯一提权入口 = `_promote_episode`，任何绕开回采生成的 Episode 都天然不进策略。
+- **为什么 mock Episode 也更新 `data_quality`（只是不提权）**：`data_quality.impact_kind` 是审计信号 —— "我们回采过、来源是 X、但因为 execution_mode=mock 所以没提权"。删掉更新会让"这条 mock 是不是真的没有事实数据"变得不可知。
+- **为什么 `evidence_action_ids` 用 JSON 而不是关联表**：1-1 是常态（一个 Episode 对一个动作），少数复合场景（"暂停+加预算"合并一次执行）用 JSON 数组表达最轻量；等 Phase 6.x 需要跨 Episode 聚合证据时再抽表。
+- **为什么 `_link_episode_to_action` 用最新一条 + tool 名 + session 匹配而不是全局 id 传递**：`ctx.memory.record()` 发生在 `tool.handler` 内部（`_write`），而 dispatcher `outcome.action.id` 只有回到 `_dispatch_via_action_store` 后才可见 —— 传递 id 需要跨越太多签名。用 (session_id, tool, action_id IS NULL) 匹配最近一条足够精确，且允许 Episode 记录失败时不 block dispatcher。
+- **为什么 StrategyStore 无 usable 样本时"完全不动 `_rules`"而不是清空**：现有已学到的规则可能来自更早的真实样本；本次 learn 只不过是"这批没有新样本"，不应回归。产品文案里"策略保持不变"就是这个语义。
+
+### Validation（验证）
+
+- Alembic：`alembic upgrade head` 成功迁移 `6aff1c23d194 → a3e6a8c67106`；`agent_episodes` 表新增 5 列并落三条索引 + FK。
+- 测试：129 passed（Phase 4.2 基线 123 + 4.3 新增 6），无回归。
+- 幂等：多次调用 `promote_usable_for_learning` / `_promote_episode` 结果一致（覆盖同 window，data_quality 增量合并 sources 去重）。
+- Mock 隔离：`test_collector_does_not_promote_mock_episode` 从 collector 端证明；`test_learn_returns_no_usable_when_only_mock_episodes` 从 strategy 端证明。两个方向都拦住 —— 即便有 mock 动作跑通完整 verify + collect 链路，策略也不会因此改动。
+
+### 已知遗留
+
+- Reflection.aggregate() / _summarize() 仍然读所有 Episode（含 predicted），供 UI 复盘展示 —— **策略学习**已经严格挡住 mock，但"复盘摘要"里可能出现 predicted 数字。前端在 Phase 6/7 展示时需要用 `data_quality.impact_kind` 做区分显示。
+- `evidence_action_ids_json` 目前只单条 append；跨动作合并的 Episode（Phase 5.x / 6.x 组合执行）需要额外的合并逻辑。
+- `_promote_episode` 只在 collector 内部触发；如果未来引入其他"事实数据到位"的信号源（例如 MMP 主动 webhook），需要抽出统一的 promote 接口。
+- `Reflection` 输出的 `avg_delta_roi_7d` 与 StrategyStore 学到的规则可能出现"看起来矛盾"的情形（一个基于 predicted 全集，一个基于 usable live 子集）—— Phase 4.3.x 或 6.x 会补齐 Reflection 侧的门禁。
+
+---
+
 ## 未发布 - 2026-07-22 — 生产升级 Phase 4.2 延迟回采（observed / attributed 从事实表回填）
 
 ### Added（新增）

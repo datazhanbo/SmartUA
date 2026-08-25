@@ -54,7 +54,7 @@ const ALERT_STATUS = {
 // ----------------------------- Provenance 标签 ----------------------------- //
 // Phase 1.2：会话 / 步骤 / 告警在任何时候都要能告诉用户"这条动作作用在 Mock / Sandbox / Live 的哪个账户"。
 const EXEC_MODE_META = {
-  mock:    { color: 'default',   label: 'MOCK',    tip: '模拟数据，不影响真实账户' },
+  mock:    { color: 'gold',      label: 'MOCK',    tip: '模拟数据，不影响真实账户；策略学习门禁会拒绝 mock 样本' },
   sandbox: { color: 'geekblue',  label: 'SANDBOX', tip: '沙箱环境，不影响真实预算' },
   live:    { color: 'red',       label: 'LIVE',    tip: '真实账户，动作将扣真实预算' },
 }
@@ -77,55 +77,146 @@ function ProvenanceTag({ platform, execution_mode, account_id, size = 'default' 
 }
 
 // ----------------------------- 影响可视化 ----------------------------- //
-function ImpactView({ impact }) {
-  if (!impact) return null
-  const f = (v) => (typeof v === 'number' ? v.toFixed(2) : v)
-  const rows = []
-  if (impact.delta_roi !== undefined)
-    rows.push({ k: 'ΔROI', v: impact.delta_roi, good: impact.delta_roi >= 0 })
-  if (impact.delta_spend !== undefined)
-    rows.push({ k: 'ΔSpend', v: impact.delta_spend, good: impact.delta_spend <= 0 })
-  if (impact.delta_installs !== undefined)
-    rows.push({ k: 'ΔInstalls', v: impact.delta_installs, good: impact.delta_installs >= 0 })
-  if (impact.horizon)
-    rows.push({ k: '窗口', v: impact.horizon + 'd', good: true })
+// Phase 4.1/4.2：三档影响严格分档展示——predicted / observed / attributed；不再用 0 冒充有效果。
+// step.result.impact 形状：{ impact_2h, impact_24h, impact_7d }，每个都是 ImpactEnvelope。
+// action 后续回采会把 observed/attributed 也写成同结构 envelope；本视图能同时消费三档。
+const IMPACT_KIND_META = {
+  predicted:  { color: 'blue',   label: '预测',   tip: 'simulate_impact 生成，仅用于展示，永远不参与策略学习' },
+  observed:   { color: 'green',  label: '实测',   tip: '来自 fact_media_daily 回采' },
+  attributed: { color: 'purple', label: '归因',   tip: '来自 MMP（AppsFlyer/Adjust）回采' },
+}
+
+function _fmtEnvelopeMetric(k, v) {
+  if (v === null || v === undefined) return '—'
+  if (typeof v !== 'number') return String(v)
+  if (k.includes('roi') || k.includes('ctr')) return v.toFixed(4)
+  if (Math.abs(v) >= 100) return v.toFixed(0)
+  return v.toFixed(2)
+}
+
+function EnvelopeChips({ envelope }) {
+  if (!envelope || typeof envelope !== 'object') return null
+  const kind = envelope.kind
+  const metrics = envelope.metrics || {}
+  const meta = IMPACT_KIND_META[kind] || { color: 'default', label: kind || 'unknown', tip: '' }
+  const completeness = envelope.completeness
+  // Phase 4.1 不变量：completeness=0 意味着"没观察到"，绝不能以 0 冒充有效果
+  const noData = kind !== 'predicted' && (completeness === 0 || completeness == null)
+  const keys = Object.keys(metrics).filter((k) => metrics[k] !== null && metrics[k] !== undefined)
+  return (
+    <Tooltip title={meta.tip}>
+      <Space size={4} wrap>
+        <Tag color={meta.color}>{meta.label} · {envelope.window || '?'}</Tag>
+        {noData ? (
+          <Tag>暂无数据</Tag>
+        ) : keys.length === 0 ? (
+          <Tag>metrics 空</Tag>
+        ) : (
+          keys.map((k) => (
+            <Tag key={k}>{k}: {_fmtEnvelopeMetric(k, metrics[k])}</Tag>
+          ))
+        )}
+        {completeness !== undefined && completeness !== null && kind !== 'predicted' && (
+          <Tag color={completeness >= 1 ? 'green' : completeness > 0 ? 'orange' : 'default'}>
+            完整性 {(completeness * 100).toFixed(0)}%
+          </Tag>
+        )}
+        {envelope.source && <Tag>{envelope.source}</Tag>}
+      </Space>
+    </Tooltip>
+  )
+}
+
+function ImpactView({ impact, predicted_impact }) {
+  // 兼容三种形态：新 (impact_2h/24h/7d envelopes)；老 (delta_* 扁平)；仅 predicted_impact envelope
+  if (!impact && !predicted_impact) return null
+  // 老 flat（迁移期兜底）
+  if (impact && (impact.delta_roi !== undefined || impact.delta_spend !== undefined)) {
+    const f = (v) => (typeof v === 'number' ? v.toFixed(2) : v)
+    const rows = []
+    if (impact.delta_roi !== undefined) rows.push({ k: 'ΔROI', v: impact.delta_roi, good: impact.delta_roi >= 0 })
+    if (impact.delta_spend !== undefined) rows.push({ k: 'ΔSpend', v: impact.delta_spend, good: impact.delta_spend <= 0 })
+    if (impact.delta_installs !== undefined) rows.push({ k: 'ΔInstalls', v: impact.delta_installs, good: impact.delta_installs >= 0 })
+    if (!rows.length) return null
+    return (
+      <div style={{ background: '#f6ffed', borderRadius: 4, padding: '8px 12px', marginTop: 8 }}>
+        <div style={{ fontSize: 12, color: '#666', marginBottom: 4 }}>预测影响（旧格式）</div>
+        <Space wrap>{rows.map((it) => <Tag key={it.k} color={it.good ? 'green' : 'red'}>{it.k}: {f(it.v)}</Tag>)}</Space>
+      </div>
+    )
+  }
+  const windows = ['impact_2h', 'impact_24h', 'impact_7d']
+  const rows = windows.map((w) => impact && impact[w]).filter(Boolean)
+  if (!rows.length && predicted_impact) rows.push(predicted_impact)
   if (!rows.length) return null
   return (
     <div style={{ background: '#f6ffed', borderRadius: 4, padding: '8px 12px', marginTop: 8 }}>
-      <div style={{ fontSize: 12, color: '#666', marginBottom: 4 }}>预测影响（控制 vs 处理）</div>
-      <Space wrap>
-        {rows.map((it) => (
-          <Tag key={it.k} color={it.good ? 'green' : 'red'}>
-            {it.k}: {f(it.v)}
-          </Tag>
-        ))}
+      <div style={{ fontSize: 12, color: '#666', marginBottom: 4 }}>影响 envelope（predicted 仅供展示；observed/attributed 由回采写回）</div>
+      <Space direction="vertical" size={4} style={{ width: '100%' }}>
+        {rows.map((env, i) => <EnvelopeChips key={i} envelope={env} />)}
       </Space>
     </div>
   )
 }
 
 // ----------------------------- 单步渲染 ----------------------------- //
+// Phase 3.2 审批过期倒计时：读取 step.expires_at（ISO 字符串），过期后禁用批准按钮并高亮
+function useCountdown(isoDeadline) {
+  const [remaining, setRemaining] = useState(() => {
+    if (!isoDeadline) return null
+    const t = new Date(isoDeadline).getTime()
+    if (Number.isNaN(t)) return null
+    return Math.floor((t - Date.now()) / 1000)
+  })
+  useEffect(() => {
+    if (!isoDeadline) { setRemaining(null); return }
+    const t = new Date(isoDeadline).getTime()
+    if (Number.isNaN(t)) { setRemaining(null); return }
+    const tick = () => setRemaining(Math.floor((t - Date.now()) / 1000))
+    tick()
+    const id = setInterval(tick, 1000)
+    return () => clearInterval(id)
+  }, [isoDeadline])
+  return remaining
+}
+
+const DISPATCH_STATE_META = {
+  verified:    { color: 'green',  label: '✅ 已核验' },
+  failed:      { color: 'red',    label: '❌ 派发失败' },
+  unknown:     { color: 'orange', label: '⏳ 状态待对账' },
+  accepted:    { color: 'blue',   label: '📤 已提交' },
+  dispatching: { color: 'blue',   label: '📤 派发中' },
+}
+
 function StepView({ step, loading, onApprove }) {
   const meta = KIND_META[step.kind] || { emoji: '•', color: '#000', label: '' }
 
   if (step.kind === 'approval') {
     const pending = step.status === 'proposed'
     const prov = step.result?.provenance
+    const remaining = useCountdown(pending ? step.expires_at : null)
+    const expired = remaining !== null && remaining <= 0
+    const soonExpiring = remaining !== null && remaining > 0 && remaining < 60
     return (
       <Card size="small" style={{ borderLeft: '4px solid #faad14', background: '#fffbe6', marginBottom: 12 }}>
         <Space direction="vertical" style={{ width: '100%' }} size={6}>
           <Space wrap>
             <Tag color="orange" icon={<SafetyOutlined />}>⏳ 待审批 {step.risk_level || ''}</Tag>
             <Text strong>{step.text}</Text>
+            {pending && step.expires_at && (
+              <Tag color={expired ? 'red' : soonExpiring ? 'orange' : 'default'}>
+                {expired ? '已过期' : `剩余 ${Math.floor(remaining / 60)}m${remaining % 60}s`}
+              </Tag>
+            )}
           </Space>
           {prov && (
             <ProvenanceTag platform={prov.platform} execution_mode={prov.execution_mode} account_id={prov.account_id} />
           )}
           {pending ? (
             <Space>
-              <Button type="primary" size="small" loading={loading}
+              <Button type="primary" size="small" loading={loading} disabled={expired}
                 icon={<CheckCircleOutlined />} onClick={() => onApprove(step.id, true)}>
-                批准执行
+                {expired ? '已过期不可执行' : '批准执行'}
               </Button>
               <Button danger size="small" onClick={() => onApprove(step.id, false, '人工拒绝')}>
                 拒绝
@@ -169,6 +260,8 @@ function StepView({ step, loading, onApprove }) {
   }
 
   if (step.kind === 'action') {
+    const dispatch = step.result?.dispatch
+    const dsMeta = dispatch && (DISPATCH_STATE_META[dispatch.state] || { color: 'default', label: dispatch.state })
     return (
       <Card size="small" style={{ borderLeft: '4px solid #52c41a', marginBottom: 12 }}>
         <Space direction="vertical" style={{ width: '100%' }} size={4}>
@@ -184,9 +277,17 @@ function StepView({ step, loading, onApprove }) {
                 size="small"
               />
             )}
+            {dispatch && (
+              <Tooltip title={dispatch.observation || ''}>
+                <Tag color={dsMeta.color}>{dsMeta.label}</Tag>
+              </Tooltip>
+            )}
+            {dispatch?.action_id && (
+              <Tag style={{ fontFamily: 'monospace', fontSize: 11 }}>#{dispatch.action_id.slice(0, 12)}</Tag>
+            )}
           </Space>
           <div>{step.text}</div>
-          <ImpactView impact={step.result?.impact} />
+          <ImpactView impact={step.result?.impact} predicted_impact={step.predicted_impact} />
         </Space>
       </Card>
     )
@@ -480,7 +581,28 @@ function AgentConsole() {
       setSession(s); await refreshSessions()
       message.success(approved ? '已批准 · Agent 继续执行' : '已驳回 · Agent 重新规划')
     } catch (e) {
-      message.error('审批失败：' + (e.response?.data?.detail || '未知错误'))
+      // Phase 3.2：审批过期 / 状态漂移 → 后端 409，detail 为结构化对象
+      const status = e.response?.status
+      const detail = e.response?.data?.detail
+      if (status === 409 && detail && typeof detail === 'object') {
+        if (detail.error === 'approval_expired') {
+          message.error('审批已过期：请重新触发提案后再审批')
+        } else if (detail.error === 'state_drifted') {
+          const drift = detail.drift || {}
+          const changes = Object.entries(drift).map(([k, v]) => `${k}: ${JSON.stringify(v.from)}→${JSON.stringify(v.to)}`).join('，')
+          message.error({
+            content: `状态已漂移，拒绝执行旧提案：${changes || '账户参数与提案时不一致'}`,
+            duration: 6,
+          })
+        } else {
+          message.error('审批失败：' + (detail.error || JSON.stringify(detail)))
+        }
+      } else {
+        const msg = typeof detail === 'string' ? detail : (e.message || '未知错误')
+        message.error('审批失败：' + msg)
+      }
+      // 冲突后强制刷新，让 UI 显示后端新状态
+      try { setSession(await agentAPI.getSession(activeId)); await refreshSessions() } catch {}
     } finally { setLoading(false) }
   }
 
@@ -534,10 +656,26 @@ function AgentConsole() {
   const handleLearn = async () => {
     try {
       const r = await agentAPI.learnStrategy()
-      message.success('策略已学习：' + (r.note || '无新学习'))
+      const note = r.note || ''
+      // Phase 4.3 学习门禁：note 以 [usable=N 条真实样本] 开头；N=0 时不能升级策略
+      const m = note.match(/\[usable=(\d+)\s*条真实样本\]/)
+      const usable = m ? Number(m[1]) : null
+      if (usable === 0) {
+        message.info('无可用真实样本：只有 execution_mode=live 且 observed/attributed 回采完成的 Episode 才能训练策略；当前策略保持不变。')
+      } else if (usable !== null) {
+        message.success(`策略已学习（基于 ${usable} 条真实样本）：${note.replace(m[0], '').trim() || '无新规则'}`)
+      } else {
+        message.success('策略已学习：' + (note || '无新学习'))
+      }
       await refreshStrategy()
     } catch (e) {
-      message.error('学习失败：' + (e.response?.data?.detail || '未知错误'))
+      const status = e.response?.status
+      const detail = e.response?.data?.detail
+      if (status === 503) {
+        message.warning('策略学习未启用或策略层未初始化')
+      } else {
+        message.error('学习失败：' + (typeof detail === 'string' ? detail : (e.message || '未知错误')))
+      }
     }
   }
 

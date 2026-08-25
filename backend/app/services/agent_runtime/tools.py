@@ -172,6 +172,15 @@ def _write(ctx: AgentContext, action: str, entity_id: str, ap: Dict,
     # 记忆：把这次经历沉淀为 Episode（闭环学习的核心燃料）
     if ctx.memory is not None:
         from app.services.agent_runtime.memory import Episode
+        # Phase 4.3 —— 记录时先标 predicted / execution_mode，不做 usable_for_learning 提权；
+        # 提权由 impact_collector 拿到真实 observed/attributed 数据后完成。
+        exec_mode = getattr(ctx.connector, "execution_mode", None)
+        data_quality = {
+            "impact_kind": "predicted",
+            "execution_mode": exec_mode,
+            "completeness": None,
+            "sources": ["simulate_impact/mock"],
+        }
         ctx.memory.record(Episode(
             session_id=getattr(ctx.session, "id", None),
             goal=getattr(ctx.session, "goal", "") or "",
@@ -188,6 +197,9 @@ def _write(ctx: AgentContext, action: str, entity_id: str, ap: Dict,
             impact=impact,
             outcome=ok,
             note=desc,
+            execution_mode=exec_mode,
+            data_quality=data_quality,
+            usable_for_learning=False,
         ))
 
     state = result.get("new_state", result.get("error", ""))

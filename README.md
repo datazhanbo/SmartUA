@@ -16,6 +16,21 @@
 
 ---
 
+## ⚡ Quick Start
+
+```bash
+make setup      # 装后端依赖 + alembic migrate + 种子数据 + 前端 npm install
+make dev        # 并行起后端 :8000 + 前端 :5173（vite proxy 已配）
+make test       # 后端 pytest
+make db-reset   # 清库 + migrate + 重新 seed
+```
+
+- `make dev` 用 `&` 并行起前后端；Ctrl-C 后若 uvicorn 未退出，`pkill -f uvicorn`，或用 `make dev-backend` / `make dev-frontend` 分开跑。
+- 默认账号见下方「快速开始」。
+- 无 LLM 凭证时自动走规则引擎兜底，不影响体验。
+
+---
+
 ## 核心特性
 
 ### 🤖 大模型意图识别（规划中）
