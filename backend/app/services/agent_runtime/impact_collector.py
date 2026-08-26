@@ -1,22 +1,23 @@
-"""Phase 4.2 —— 延迟回采：从事实表读真实变化，写回 observed / attributed。
+"""Phase 4.2 / 4.4 —— 延迟回采：从事实表读真实变化，写回 observed / attributed。
 
-流程（单进程、同步；Phase 5.2 会由独立 worker 消费）：
+流程（单进程、同步；由 Durable JobRunner tick 驱动）：
 
-1. `enqueue_after_verified(db, action)`  —— dispatcher 把动作推进到 `verified` 时调用，
-   生成 6 条 job：`{observed, attributed} × {2h, 24h, 7d}`。
-2. 到点后 `run_due_jobs(db, now=...)` 挑出 `scheduled` 且 `scheduled_at <= now` 的 job，
-   针对每一条：
+1. `enqueue_after_verified(db, action)` —— dispatcher 把动作推进到 `verified` 时调用，
+   在通用 `agent_jobs` 表里生成 6 条 job（`impact_collect`，
+   payload=`{action_id, kind, window}`）：{observed, attributed} × {2h, 24h, 7d}。
+2. JobRunner 到点后调 `run_impact_job(db, payload)`：
    - 计算「动作前基线窗口」和「动作后观测窗口」在 FactMediaDaily / FactMMPDaily 上的
      聚合指标，二者相减得到 delta。
    - 写入 `AgentActionDB.observed_impact_json` / `attributed_impact_json`（本次 window 的
      envelope 覆盖旧值：同一 window 的 24h envelope 是"最新的 24h 观察"）。
-   - Job 落 `envelope_json` 副本、`status="done"`。
+   - Job 落 `done` 并把 envelope 写进 `result` 字段。
 3. 找不到事实数据 → envelope 仍写入，但 `metrics={}` 且 `completeness=0.0`；job 标记
    `done`（不是失败：只是当前没数据，不代表以后没有 —— 但同 window 只回采一次，避免抖动）。
    **这是 Phase 4.1 定的核心不变量：没有观察到就是没有观察到，禁止用 0 冒充有效果。**
 
-时钟通过 `now` 参数注入，测试可任意伪造。生产由外部调度器（APScheduler 或 cron）定期
-调 `run_due_jobs`。
+时钟通过 `now` 参数注入，测试可任意伪造。生产由 APScheduler tick 定期调
+`JobRunner.run_pending(job_type="impact_collect")`；`run_due_jobs` 保留为便捷入口，
+供外部 cron / API 直接触发。
 """
 from __future__ import annotations
 
@@ -28,7 +29,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.models.agent_runtime import AgentActionDB, AgentImpactJobDB
+from app.models.agent_runtime import AgentActionDB, JobDB
 from app.services.agent_runtime.impact import make_attributed, make_observed
 
 logger = logging.getLogger(__name__)
@@ -43,14 +44,18 @@ _WINDOW_SPECS: Dict[str, timedelta] = {
 _BASELINE = timedelta(days=7)
 
 _JOB_KINDS = ("observed", "attributed")
+_JOB_TYPE = "impact_collect"
 
 
+# --------------------------------------------------------------------------- #
+# Enqueue（verified 时触发）
+# --------------------------------------------------------------------------- #
 def enqueue_after_verified(db: Session, action: AgentActionDB,
-                            now: Optional[datetime] = None) -> List[AgentImpactJobDB]:
+                            now: Optional[datetime] = None) -> List[JobDB]:
     """Verified 动作触发六条 impact job（observed × 3 + attributed × 3）。
 
     - 无 entity_id → 跳过（回采查不到事实表关键字段）。
-    - 已存在同 (action_id, kind, window) 的 job → 跳过（幂等）。
+    - 已存在同 idempotency_key 的 job → 跳过（幂等）。
     """
     if not action.entity_id:
         logger.info("skip enqueue for action %s (no entity_id)", action.id)
@@ -59,17 +64,24 @@ def enqueue_after_verified(db: Session, action: AgentActionDB,
     now = now or datetime.utcnow()
     base_time = action.verified_at or action.accepted_at or now
 
-    created: List[AgentImpactJobDB] = []
+    created: List[JobDB] = []
     for kind in _JOB_KINDS:
         for window, dur in _WINDOW_SPECS.items():
-            job = AgentImpactJobDB(
+            idem = f"impact:{action.id}:{kind}:{window}"
+            job = JobDB(
                 id=uuid.uuid4().hex[:32],
-                action_id=action.id,
-                app_id=action.app_id,
-                kind=kind,
-                window=window,
-                scheduled_at=base_time + dur,
+                job_type=_JOB_TYPE,
+                idempotency_key=idem,
                 status="scheduled",
+                scheduled_at=base_time + dur,
+                payload={
+                    "action_id": action.id,
+                    "kind": kind,
+                    "window": window,
+                },
+                app_id=action.app_id,
+                attempts=0,
+                max_attempts=1,
             )
             db.add(job)
             try:
@@ -82,64 +94,96 @@ def enqueue_after_verified(db: Session, action: AgentActionDB,
     return created
 
 
+# --------------------------------------------------------------------------- #
+# JobRunner handler
+# --------------------------------------------------------------------------- #
+def run_impact_job(db: Session, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """JobRunner 入口：跑一条 impact_collect job，返回 {action_id, kind, window, envelope, has_data}。"""
+    action_id = payload["action_id"]
+    kind = payload["kind"]
+    window = payload["window"]
+    now = datetime.utcnow()
+
+    action = db.query(AgentActionDB).filter(AgentActionDB.id == action_id).first()
+    if action is None:
+        raise LookupError(f"action row missing: {action_id}")
+
+    envelope, has_data = _collect_one(db, action, kind=kind, window=window, executed_at=now)
+
+    if kind == "observed":
+        action.observed_impact_json = envelope
+    else:
+        action.attributed_impact_json = envelope
+
+    db.flush()
+
+    # Phase 4.3 —— 回填到 Episode（若存在关联）并按门禁提权 usable_for_learning
+    if has_data:
+        _promote_episode(db, action.id, kind=kind, window=window, envelope=envelope)
+
+    return {
+        "action_id": action_id,
+        "kind": kind,
+        "window": window,
+        "has_data": has_data,
+        "envelope": envelope,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# 便捷入口：外部 cron / API 直接触发到点 job
+# --------------------------------------------------------------------------- #
 def due_jobs(db: Session, now: Optional[datetime] = None,
              limit: int = 200,
-             app_id: Optional[int] = None) -> List[AgentImpactJobDB]:
-    """挑出到点的、还没执行完的 job。可选按 app_id 过滤（Phase 2.1 边界）。"""
+             app_id: Optional[int] = None) -> List[JobDB]:
+    """挑出到点的、还没执行完的 impact_collect job。"""
     now = now or datetime.utcnow()
-    q = db.query(AgentImpactJobDB).filter(
-        AgentImpactJobDB.status == "scheduled",
-        AgentImpactJobDB.scheduled_at <= now,
+    q = db.query(JobDB).filter(
+        JobDB.job_type == _JOB_TYPE,
+        JobDB.status == "scheduled",
+        JobDB.scheduled_at <= now,
     )
     if app_id is not None:
-        q = q.filter(AgentImpactJobDB.app_id == app_id)
-    return q.order_by(AgentImpactJobDB.scheduled_at.asc()).limit(limit).all()
+        q = q.filter(JobDB.app_id == app_id)
+    return q.order_by(JobDB.scheduled_at.asc()).limit(limit).all()
 
 
 def run_due_jobs(db: Session, now: Optional[datetime] = None,
                  limit: int = 200,
                  app_id: Optional[int] = None) -> Dict[str, int]:
-    """跑一遍所有到点的 job，返回统计：{done, empty, failed}。app_id 过滤同 due_jobs。"""
+    """跑一遍到点的 impact_collect job，返回 {done, empty, failed}。
+
+    独立于 JobRunner 单例使用，供 API / cron 直接触发。
+    """
     now = now or datetime.utcnow()
     stats = {"done": 0, "empty": 0, "failed": 0}
     for job in due_jobs(db, now=now, limit=limit, app_id=app_id):
-        action = db.query(AgentActionDB).filter(AgentActionDB.id == job.action_id).first()
-        if action is None:
-            job.status = "failed"
-            job.error = "action row missing"
-            db.flush()
-            stats["failed"] += 1
-            continue
-
-        try:
-            envelope, has_data = _collect_one(db, action, job)
-        except Exception as e:
-            logger.exception("collect job %s raised", job.id)
-            job.status = "failed"
-            job.error = f"{type(e).__name__}: {e}"
-            job.executed_at = now
-            db.flush()
-            stats["failed"] += 1
-            continue
-
-        # 写回 AgentActionDB.observed / attributed（同 window envelope 覆盖旧值）
-        if job.kind == "observed":
-            action.observed_impact_json = envelope
-        else:
-            action.attributed_impact_json = envelope
-
-        job.envelope_json = envelope
-        job.status = "done"
-        job.executed_at = now
+        # claim
+        job.status = "running"
+        job.started_at = now
+        job.attempts = (job.attempts or 0) + 1
         db.flush()
-        # Phase 4.3 —— 回填到 Episode（若存在关联）并按门禁提权 usable_for_learning
-        if has_data:
-            _promote_episode(db, action.id, kind=job.kind,
-                             window=job.window, envelope=envelope)
-        stats["done" if has_data else "empty"] += 1
+        try:
+            result = run_impact_job(db, job.payload or {})
+        except Exception as e:
+            logger.exception("impact job %s raised", job.id)
+            job.status = "failed"
+            job.finished_at = now
+            job.last_error = f"{type(e).__name__}: {e}"
+            stats["failed"] += 1
+            db.flush()
+            continue
+        job.status = "done"
+        job.finished_at = now
+        job.result = result
+        stats["done" if result.get("has_data") else "empty"] += 1
+        db.flush()
     return stats
 
 
+# --------------------------------------------------------------------------- #
+# Episode 提权（Phase 4.3）
+# --------------------------------------------------------------------------- #
 def _promote_episode(db: Session, action_id: str, *, kind: str,
                      window: str, envelope: Dict[str, Any]) -> None:
     """把回采到的真实 envelope 写回 Episode.impact，并按门禁把 usable_for_learning 置为 True。
@@ -177,12 +221,14 @@ def _promote_episode(db: Session, action_id: str, *, kind: str,
         logger.exception("promote episode after collect failed for action %s", action_id)
 
 
-def _collect_one(db: Session, action: AgentActionDB,
-                 job: AgentImpactJobDB) -> Tuple[Dict[str, Any], bool]:
-    """核心：读事实表 → 计算 delta → 生成 envelope。"""
+# --------------------------------------------------------------------------- #
+# 核心：读事实表 → 计算 delta → 生成 envelope
+# --------------------------------------------------------------------------- #
+def _collect_one(db: Session, action: AgentActionDB, *, kind: str, window: str,
+                 executed_at: datetime) -> Tuple[Dict[str, Any], bool]:
     action_time = action.verified_at or action.accepted_at or action.created_at
     action_day = action_time.date()
-    window_dur = _WINDOW_SPECS[job.window]
+    window_dur = _WINDOW_SPECS[window]
     # FactMediaDaily / FactMMPDaily 是日粒度，所以窗口都按日对齐：
     #   pre  = [action_day - 7, action_day)  —— 严格早于动作当天
     #   post = [action_day, action_day + ceil(window_days)]  —— 含动作当天
@@ -193,21 +239,21 @@ def _collect_one(db: Session, action: AgentActionDB,
     post_start = action_day
     post_end = action_day + timedelta(days=post_days)
 
-    if job.kind == "observed":
+    if kind == "observed":
         source_id = _fact_media_source(action.platform)
         post_metrics, post_rows = _aggregate_media(
             db, action, post_start, post_end, source_id)
         pre_metrics, pre_rows = _aggregate_media(
             db, action, pre_start, pre_end, source_id)
         if pre_rows == 0 and post_rows == 0:
-            return _empty_envelope(job.kind, job.window,
+            return _empty_envelope(kind, window,
                                     source=source_id or "fact_media_daily",
-                                    freshness=job.executed_at), False
+                                    freshness=executed_at), False
         pre_days = max(1, (pre_end - pre_start).days)
         post_days = max(1, (post_end - post_start).days)
         delta = _delta_media(pre_metrics, post_metrics, pre_days, post_days)
         completeness = _completeness(pre_rows, post_rows)
-        return make_observed(delta, window=job.window,
+        return make_observed(delta, window=window,
                              source=source_id or "fact_media_daily",
                              currency="USD",
                              completeness=completeness), True
@@ -218,13 +264,13 @@ def _collect_one(db: Session, action: AgentActionDB,
     pre_metrics, pre_rows = _aggregate_mmp(
         db, action, pre_start, pre_end)
     if pre_rows == 0 and post_rows == 0:
-        return _empty_envelope(job.kind, job.window, source="appsflyer_mmp",
-                                freshness=job.executed_at), False
+        return _empty_envelope(kind, window, source="appsflyer_mmp",
+                                freshness=executed_at), False
     pre_days = max(1, (pre_end - pre_start).days)
     post_days = max(1, (post_end - post_start).days)
     delta = _delta_mmp(pre_metrics, post_metrics, pre_days, post_days)
     completeness = _completeness(pre_rows, post_rows)
-    return make_attributed(delta, window=job.window, source="appsflyer_mmp",
+    return make_attributed(delta, window=window, source="appsflyer_mmp",
                            currency="USD",
                            completeness=completeness), True
 
@@ -305,11 +351,7 @@ def _aggregate_mmp(db: Session, action: AgentActionDB,
 
 def _delta_media(pre: Dict[str, Any], post: Dict[str, Any],
                  pre_days: int, post_days: int) -> Dict[str, Any]:
-    """Media 事实表 delta：日均口径（避免不同长度窗口误比较）。
-
-    - `delta_spend/impressions/clicks/installs` = post 日均 − pre 日均
-    - 派生指标（cpi/ctr）也用日均比值算，缺分母返回 None。
-    """
+    """Media 事实表 delta：日均口径（避免不同长度窗口误比较）。"""
     pre_rate = {k: pre[k] / pre_days for k in ("spend", "impressions", "clicks", "installs")}
     post_rate = {k: post[k] / post_days for k in ("spend", "impressions", "clicks", "installs")}
     d_spend = post_rate["spend"] - pre_rate["spend"]
@@ -348,10 +390,7 @@ def _delta_mmp(pre: Dict[str, Any], post: Dict[str, Any],
 
 
 def _completeness(pre_rows: int, post_rows: int) -> float:
-    """粗颗粒度：两个窗口都有数据 → 1.0；只有一边 → 0.5；都没有 → 0.0。
-
-    真实完整性算法（缺日、缺币种、MMP 覆盖率）等到 Phase 4.3/6 再细化。
-    """
+    """粗颗粒度：两个窗口都有数据 → 1.0；只有一边 → 0.5；都没有 → 0.0。"""
     if pre_rows > 0 and post_rows > 0:
         return 1.0
     if pre_rows > 0 or post_rows > 0:
@@ -361,10 +400,7 @@ def _completeness(pre_rows: int, post_rows: int) -> float:
 
 def _empty_envelope(kind: str, window: str, source: str,
                     freshness: Optional[datetime]) -> Dict[str, Any]:
-    """事实表命中 0 行时的 envelope：metrics 保持空，completeness=0.0。
-
-    对应 Phase 4.1 不变量：没有观察到就是没有观察到，绝不能用 0 冒充有效果。
-    """
+    """事实表命中 0 行时的 envelope：metrics 保持空，completeness=0.0。"""
     fresh_iso = freshness.isoformat() if isinstance(freshness, datetime) else None
     if kind == "observed":
         return make_observed({}, window=window, source=source,

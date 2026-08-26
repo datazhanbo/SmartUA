@@ -8,8 +8,8 @@ from sqlalchemy.orm import sessionmaker
 # Migration tests use real file-based SQLite databases (alembic needs a file).
 # They do not import from conftest.py to avoid the in-memory override.
 
-_KNOWN_TABLES = 35  # Baseline (33) + phase3.1 agent_actions + phase4.2 agent_impact_jobs
-_HEAD_REVISION = "a3e6a8c67106"  # phase4.3 episode learning gate
+_KNOWN_TABLES = 35  # Baseline (33) + agent_actions + agent_jobs (agent_impact_jobs 收敛进 agent_jobs)
+_HEAD_REVISION = "6c0b1d9e4a3f"  # phase4.4 durable jobs
 
 
 @pytest.fixture

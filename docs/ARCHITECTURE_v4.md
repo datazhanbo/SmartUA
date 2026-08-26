@@ -47,11 +47,12 @@ v3 阶段既不接生产多媒体真实凭证，也不上 durable worker（Phase
 | `memory.py` | Episode dataclass；`usable_episodes()` / `promote_usable_for_learning()` 门禁入口 | 未变 |
 | `reflection.py` | Reflector 摘要 | 未变 |
 | `strategy.py` | StrategyStore；`learn_from_memory` 只读 usable Episode | 未变 |
-| `autonomy.py` | AnomalyDetector + AutonomyEngine + APScheduler | 未变（已知遗留：仍绕过 pipeline 直调 tool.handler） |
+| `autonomy.py` | AnomalyDetector + AutonomyEngine；APScheduler 只做 tick（autonomy enqueue + JobRunner tick），业务逻辑在 `run_autonomy_scan_job` handler；`agent_autonomy_enabled=false` 时只跑 tick 不入队 | v4.3 重构 |
+| **`jobs.py`** | `JobRunner`（register/enqueue/run_pending/recover_stale）+ `JobDB`（`agent_jobs` 表）；通用 durable 任务运行器，APScheduler 只做高频 tick | v4.3 新增 |
 | `action_store.py` | AgentActionDB 幂等键 + `mint_or_get` + 状态跳转 | 未变 |
 | `dispatcher.py` | `Dispatcher.dispatch_and_verify()` / `reconcile()` / `_verify_state` | 未变 |
 | `impact.py` | ImpactEnvelope + `make_predicted / make_observed / make_attributed` | 未变 |
-| `impact_collector.py` | `enqueue_after_verified` / `run_due_jobs`；6 条 job；`_promote_episode` 门禁提权 | 未变 |
+| `impact_collector.py` | `enqueue_after_verified` 落 `agent_jobs`；`run_impact_job`（JobRunner handler）；`run_due_jobs` 保留为独立便捷入口（API/cron 用） | v4.3 收敛 |
 
 **Agent Loop 一次写动作的完整链路（v4，pipeline 驱动）**：
 
@@ -101,6 +102,20 @@ observe → decide (LLM 或 planner.rule_based_decide)
 MCP 工具进入 registry 后与内置工具**走同一条 middleware chain**（BudgetGuard / 审批 / 审计 / dispatcher），这是 P0 抽 pipeline 的直接收益。运行时可用 `registry.register_provider / unregister_provider / refresh_providers` 挂载、卸载、热刷新。
 
 完整配置、frontmatter 规范、写自定义 Provider 的范本见 **[`SKILL_SYSTEM.md`](SKILL_SYSTEM.md)**。
+
+### 2.3 Durable Background Jobs（v4.3 新增）
+
+后台任务统一落 `agent_jobs` 表（`JobDB`），APScheduler 只做高频 tick，不再直接跑业务：
+
+- `jobs.py::JobRunner` 提供 `register(job_type, handler)` / `enqueue(...)` / `run_pending(...)` / `recover_stale(...)`。
+- 状态机：`scheduled → running → done/failed`；`attempts < max_attempts` 时异常回 `scheduled` 等下个 tick 重试。
+- **重启恢复**：进程启动时 `start_scheduler()` 立刻跑一次 `recover_stale + run_pending`，离线期间到点的 impact job、上次崩溃卡在 running 的任务都会被拾起。
+- **幂等 enqueue**：`idempotency_key` UNIQUE；impact 用 `impact:{action_id}:{kind}:{window}`，autonomy 用 `autonomy:scan:{app_id}:{bucket}`（时间桶去重）。
+- 内置 handler：`impact_collect`（封装原 `_collect_one` + Episode 提权）、`autonomy_scan`（`AutonomyEngine.scan`）。
+- APScheduler 起两个 job：`autonomy_enqueue`（按 `agent_autonomy_interval_seconds` 入队，受 `agent_autonomy_enabled` 控制）+ `job_runner_tick`（按 `agent_jobs_tick_seconds` 默认 30s，跑 `recover_stale + run_pending`）。
+- 刻意不做：多实例并发锁、priority queue、DAG 依赖、Celery/Temporal/Redis——SQLite 单进程是当前部署形态。
+
+变更说明与验收见 **[`changes/2026-08-26-durable-background-jobs.md`](changes/2026-08-26-durable-background-jobs.md)**。
 
 ---
 
@@ -179,15 +194,14 @@ ImpactEnvelope(
 
 ### 4.3 延迟回采
 
-`impact_collector.enqueue_after_verified(db, action)`：动作 verified 后生成 6 条 job（observed × 3 + attributed × 3），scheduled_at 精确对齐 `verified_at + {2h, 24h, 7d}`。
+`impact_collector.enqueue_after_verified(db, action)`：动作 verified 后在 `agent_jobs` 表生成 6 条 job（`job_type="impact_collect"`，observed × 3 + attributed × 3），scheduled_at 精确对齐 `verified_at + {2h, 24h, 7d}`。
 
-`run_due_jobs(db, now=None)`：拾起到点 job，聚合窗口 `pre=[action_day-7, action_day)` 与 `post=[action_day, action_day+window_days)`，日均口径求 delta。写回 AgentActionDB 与 job envelope。
+`run_impact_job(db, payload)`：JobRunner handler，聚合窗口 `pre=[action_day-7, action_day)` 与 `post=[action_day, action_day+window_days)`，日均口径求 delta。写回 AgentActionDB.observed/attributed_impact_json + job.result。
 
 - 事实表 0 行 → envelope 存在但 `metrics={} && completeness=0.0` → job 标记 done（不再重跑）。
 - Media 走 FactMediaDaily 聚合，MMP 走 FactMMPDaily 聚合；不同源分别 enqueue 允许各自 SLA。
-- `run_due_jobs` 幂等：done 状态不会二次处理。
-
-生产调度：v3 暂由外部（APScheduler / cron / 脚本）周期调用 `run_due_jobs`；Phase 5.2 交给 durable worker。
+- `run_due_jobs(db, ...)`：保留为独立便捷入口（`POST /agent/impact/collect` / 外部 cron 用），不依赖 JobRunner 单例，内部直接 claim + 调 `run_impact_job`。
+- 生产调度：APScheduler tick 每 `agent_jobs_tick_seconds`（默认 30s）跑 `JobRunner.run_pending(job_type="impact_collect")`；进程重启后 `recover_stale` 自动恢复崩溃 running 的 job。
 
 ---
 

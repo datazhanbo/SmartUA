@@ -116,6 +116,12 @@ class Settings(BaseSettings):
     # 从 URL / 代理日志 / 浏览器历史移除；仅在需要向前兼容旧前端时短期开启。
     agent_sse_allow_legacy_token: bool = False
 
+    # ===== P2 #4: Durable Background Jobs =====
+    # JobRunner tick 间隔（秒）：从 agent_jobs 表拾取到点的 scheduled job 执行。
+    agent_jobs_tick_seconds: int = 30
+    # running job 超过此分钟数未结束视为崩溃，recover_stale 会复位重试或标记 failed。
+    agent_jobs_stale_minutes: int = 10
+
     class Config:
         env_file = ".env"
 

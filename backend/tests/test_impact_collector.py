@@ -18,7 +18,7 @@ from decimal import Decimal
 import pytest
 
 from app.db.base import SessionLocal
-from app.models.agent_runtime import AgentActionDB, AgentImpactJobDB
+from app.models.agent_runtime import AgentActionDB, JobDB
 from app.models.data import FactMediaDaily, FactMMPDaily
 from app.services.agent_runtime.impact import make_predicted
 from app.services.agent_runtime.impact_collector import (
@@ -30,7 +30,7 @@ from app.services.agent_runtime.impact_collector import (
 def db():
     s = SessionLocal()
     try:
-        s.query(AgentImpactJobDB).delete()
+        s.query(JobDB).delete()
         s.query(AgentActionDB).delete()
         s.query(FactMediaDaily).delete()
         s.query(FactMMPDaily).delete()
@@ -116,13 +116,13 @@ def test_enqueue_creates_six_jobs(db):
     jobs = enqueue_after_verified(db, act, now=T0)
     db.commit()
     assert len(jobs) == 6
-    kinds = sorted((j.kind, j.window) for j in jobs)
+    kinds = sorted((j.payload["kind"], j.payload["window"]) for j in jobs)
     assert kinds == [
         ("attributed", "24h"), ("attributed", "2h"), ("attributed", "7d"),
         ("observed", "24h"),   ("observed", "2h"),   ("observed", "7d"),
     ]
     # scheduled_at 相对 verified_at 精确
-    by_key = {(j.kind, j.window): j for j in jobs}
+    by_key = {(j.payload["kind"], j.payload["window"]): j for j in jobs}
     assert by_key[("observed", "2h")].scheduled_at == T0 + timedelta(hours=2)
     assert by_key[("observed", "24h")].scheduled_at == T0 + timedelta(hours=24)
     assert by_key[("observed", "7d")].scheduled_at == T0 + timedelta(days=7)
@@ -142,8 +142,9 @@ def test_enqueue_is_idempotent(db):
     again = enqueue_after_verified(db, act, now=T0)
     db.commit()
     assert again == []
-    assert db.query(AgentImpactJobDB).filter(
-        AgentImpactJobDB.action_id == act.id).count() == 6
+    assert db.query(JobDB).filter(
+        JobDB.job_type == "impact_collect",
+        JobDB.idempotency_key.like(f"impact:{act.id}:%")).count() == 6
 
 
 # ------------------------ run_due_jobs 时序 ------------------------ #
@@ -156,8 +157,9 @@ def test_not_due_yet_jobs_are_skipped(db):
     stats = run_due_jobs(db, now=T0 + timedelta(minutes=30))
     db.commit()
     assert stats == {"done": 0, "empty": 0, "failed": 0}
-    assert db.query(AgentImpactJobDB).filter(
-        AgentImpactJobDB.status == "scheduled").count() == 6
+    assert db.query(JobDB).filter(
+        JobDB.job_type == "impact_collect",
+        JobDB.status == "scheduled").count() == 6
 
 
 def test_2h_window_runs_but_7d_still_pending(db):
@@ -169,8 +171,8 @@ def test_2h_window_runs_but_7d_still_pending(db):
     db.commit()
     # 无事实数据 → empty=2
     assert stats["done"] + stats["empty"] == 2
-    still_scheduled = db.query(AgentImpactJobDB).filter(
-        AgentImpactJobDB.status == "scheduled").count()
+    still_scheduled = db.query(JobDB).filter(
+        JobDB.status == "scheduled").count()
     assert still_scheduled == 4
 
 

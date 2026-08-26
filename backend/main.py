@@ -100,13 +100,20 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("LLM 路由初始化失败（将使用规则引擎兜底）：%s", e)
 
-    # 启动：若开启主动自治，拉起 APScheduler 后台周期巡检
-    if settings.agent_autonomy_enabled:
-        try:
-            from app.services.agent_runtime.autonomy import start_scheduler
-            start_scheduler()
-        except Exception as e:
-            logger.warning("主动自治调度启动失败：%s", e)
+    # 启动：注册 Durable Job handlers（impact_collect / autonomy_scan）
+    try:
+        from app.services.agent_runtime.jobs import register_default_handlers
+        register_default_handlers()
+    except Exception as e:
+        logger.warning("Durable job handlers 注册失败：%s", e)
+
+    # 启动：拉起 APScheduler（autonomy enqueue + job runner tick）。
+    # 调度器本身只做高频 tick，真正的 job 状态在 DB，重启可恢复。
+    try:
+        from app.services.agent_runtime.autonomy import start_scheduler
+        start_scheduler()
+    except Exception as e:
+        logger.warning("Durable 调度启动失败：%s", e)
     yield
     # 关闭：停掉调度器
     try:

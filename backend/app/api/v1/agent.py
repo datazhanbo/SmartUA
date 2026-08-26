@@ -623,7 +623,7 @@ def impact_collect(
 ):
     """Phase 4.2 —— 触发一次 `run_due_jobs`，把到点 impact job 从事实表回采。
 
-    - 只回采 req.app_id 范围内的 job（通过 AgentImpactJobDB.app_id 过滤，见 collector 实现）。
+    - 只回采 req.app_id 范围内的 job（通过 agent_jobs.app_id 过滤，见 collector 实现）。
     - 生产建议由外部调度器（APScheduler / cron）周期调用；本端点主要用于运维手动触发与验收。
     """
     require_app_access(current_user, req.app_id, db)

@@ -20,7 +20,7 @@ import pytest
 
 from app.db.base import SessionLocal
 from app.models.agent_runtime import (
-    AgentActionDB, AgentImpactJobDB, EpisodeDB,
+    AgentActionDB, JobDB, EpisodeDB,
 )
 from app.models.data import FactMediaDaily, FactMMPDaily
 from app.services.agent_runtime.impact import make_predicted
@@ -38,7 +38,7 @@ T0 = datetime(2026, 7, 10, 12, 0, 0)
 def db():
     s = SessionLocal()
     try:
-        s.query(AgentImpactJobDB).delete()
+        s.query(JobDB).delete()
         s.query(EpisodeDB).delete()
         s.query(AgentActionDB).delete()
         s.query(FactMediaDaily).delete()

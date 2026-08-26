@@ -2,7 +2,7 @@
 
 > 基于 2026-08 DeepSeek Harness (DSH) / OpenAI Codex Harness / OpenClaw 三家开源 runtime 的架构调研，对 SmartUA 现有实现的补强建议。
 > 创建：2026-08-24
-> 状态：P0（#1 Tool Pipeline Middleware、#5 Makefile）于 2026-08-25 完成 ✅；P1 #3（AdSet/Ad 粒度 mock/sandbox 层）于 2026-08-25 完成 ✅；P1 #2（MCP Provider + Skill Loader）于 2026-08-25 完成 ✅；P2 #4 待执行。
+> 状态：P0（#1 Tool Pipeline Middleware、#5 Makefile）于 2026-08-25 完成 ✅；P1 #3（AdSet/Ad 粒度 mock/sandbox 层）于 2026-08-25 完成 ✅；P1 #2（MCP Provider + Skill Loader）于 2026-08-25 完成 ✅；P2 #4（Durable Background Jobs）于 2026-08-26 完成 ✅。**Harness 升级计划全部完成。**
 > 关联：[ARCHITECTURE_v4.md](ARCHITECTURE_v4.md)、[TOOL_PIPELINE_v1.md](TOOL_PIPELINE_v1.md)、[SKILL_SYSTEM.md](SKILL_SYSTEM.md)、[changes/2026-08-25-tool-pipeline-middleware.md](changes/2026-08-25-tool-pipeline-middleware.md)、[changes/2026-08-25-adset-ad-granularity.md](changes/2026-08-25-adset-ad-granularity.md)、[changes/2026-08-25-mcp-provider-skill-loader.md](changes/2026-08-25-mcp-provider-skill-loader.md)、[CONNECTOR_DESIGN_v3.md](CONNECTOR_DESIGN_v3.md)、[AGENT_ITERATION_ROADMAP.md](AGENT_ITERATION_ROADMAP.md)
 
 ---
@@ -143,24 +143,29 @@ Consumer 层：`builtin/` 新增 4 个工具——`observe_adsets`(L0)、`adjust
 
 ---
 
-### 4. Durable Background Jobs（P2）
+### 4. Durable Background Jobs（P2） — ✅ 2026-08-26 完成
 
-**现状**：impact 回采（6 条延迟 job，predicted/observed/attributed 三类影响）靠进程内 APScheduler，`autonomy.py` 的 `AnomalyDetector` + `AutonomyEngine` 也是 120s 扫描进程内调度。进程重启 job 状态丢失，无法多实例。
+> 变更说明：[changes/2026-08-26-durable-background-jobs.md](changes/2026-08-26-durable-background-jobs.md)。
 
-**OpenClaw 启发**：heartbeat 是核心原语，但 OpenClaw 的 heartbeat 状态也是文件级持久化。DSH 有 `ctx.jobs` background work seam。
+**现状（升级前）**：impact 回采的 6 条延迟 job 已有专用表 `agent_impact_jobs` 但无调度器自动消费（靠 API/cron 手动触发）；`autonomy.py` 走进程内 APScheduler，重启丢状态。
 
-**方案**：短期不引入 Celery/Temporal（过度工程），做最小 durable 版本：
+**方案（已落地）**：
 
-- 新建 `jobs/models.py`：`JobState` 表（job_id、job_type、status、scheduled_at、started_at、finished_at、payload、result、attempts）
-- `jobs/scheduler.py`：APScheduler 启动时从 DB 恢复 pending job，执行后更新状态
-- 现有 `impact_collector.py` 的 6 条回采 job 和 `autonomy.py` 的扫描 job 改为走 JobState
+- 新建 `agent_runtime/jobs.py`：`JobRunner` + `JobDB`（`agent_jobs` 表，`id/job_type/idempotency_key/status/scheduled_at/started_at/finished_at/payload/result/attempts/max_attempts/last_error/app_id`）。
+- Alembic 迁移 `6c0b1d9e4a3f_phase4_4_durable_jobs.py`：建 `agent_jobs` + drop 旧 `agent_impact_jobs`（pre-production 无数据保留需求；downgrade 重建）。
+- `JobRunner`：`register/enqueue/recover_stale/run_pending`；claim 时置 running+attempts++；异常按 max_attempts 重试或落 failed；stale running 超时自动复位。
+- 内置两个 handler：`impact_collect`（封装原 `_collect_one` + Episode 提权）、`autonomy_scan`（调 `AutonomyEngine.scan`）。
+- `impact_collector.enqueue_after_verified` 改写 `JobDB`，`idempotency_key=f"impact:{action_id}:{kind}:{window}"`；`run_due_jobs` 保留为独立便捷入口（API/cron 用），内部直接 claim + run_impact_job。
+- `autonomy.start_scheduler` 改造：APScheduler 不再直接跑业务，只起两个 tick——`autonomy_enqueue`（按 interval 时间桶入队）+ `job_runner_tick`（每 30s `recover_stale + run_pending`）；启动立即补一次。
+- 配置：`agent_jobs_tick_seconds`（默认 30）、`agent_jobs_stale_minutes`（默认 10）。
 
-**验收**：
-- 进程重启后 pending job 自动恢复执行
-- 测试：test_jobs_persistence.py（新建）模拟 job 执行中 kill → 重启 → job 继续
-- 不引入 Redis/RabbitMQ——SQLite 够 SmartUA 当前量级
+**验收（实测）**：
+- 194 passed（181 → 194，新增 13：`tests/test_jobs_persistence.py`）
+- `alembic upgrade head` 7 个 revision 全通；`alembic check` 无 diff
+- `test_restart_picks_up_pending_jobs` / `test_impact_jobs_survive_runner_restart` 证明新 JobRunner 实例能拾起 pending job
+- `test_recover_stale_resets_running_job` 证明崩溃 running 被复位续跑
 
-**不做**：多实例并发锁、job priority queue、DAG 依赖——等真有第二个客户实例再考虑。
+**未做（刻意保留）**：多实例并发锁、priority queue、DAG 依赖、Celery/Temporal/Redis——单进程 + SQLite 是当前部署形态，等真有第二个实例再加 claim_token。
 
 ---
 
@@ -192,9 +197,9 @@ README 顶部已加 Quick Start 段落，写清每条命令做了什么，并说
 | 5 | Makefile 启动 | P2 | 半天 | ✅ 2026-08-25 完成 |
 | 3 | AdSet/Ad 粒度 Connector | P1 | 3-4 天 | ✅ mock/sandbox 层 2026-08-25 完成（live 待接） |
 | 2 | MCP Provider + Skill Loader | P1 | 3-5 天 | ✅ 2026-08-25 完成（httpx-only streamable-http；文件 skill） |
-| 4 | Durable Jobs | P2 | 2-3 天 | ⏳ 待执行（#1/#2/#3 后 job 触发逻辑更清晰） |
+| 4 | Durable Jobs | P2 | 2-3 天 | ✅ 2026-08-26 完成（agent_jobs 表 + JobRunner + recover_stale） |
 
-**建议执行顺序**：~~#1 → #5（同日）~~ ✅ → ~~#3~~ ✅ → ~~#2~~ ✅ → #4。#1 是地基，不拆后面加什么都往 799 行 loop 里堆。
+**建议执行顺序**：~~#1 → #5（同日）~~ ✅ → ~~#3~~ ✅ → ~~#2~~ ✅ → ~~#4~~ ✅。**Harness 升级计划全部完成。**
 
 ---
 

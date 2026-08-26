@@ -170,39 +170,46 @@ class AgentActionDB(Base):
     )
 
 
-# Phase 4.2 — 延迟回采（observed / attributed impact） -----------------------
+# Phase 4.4 —— Durable Background Jobs（P2 #4） ----------------------------
 #
-# 动作 verified 之后，dispatcher enqueue 三条 job（2h / 24h / 7d）。
-# Collector（由外部定时器或 tests 直接调）到点后读 FactMediaDaily / FactMMPDaily，
-# 计算「动作前基线 vs 动作后窗口」的 delta，写回 AgentActionDB.observed_impact_json
-# / attributed_impact_json 并把 job 标记为 done。
+# 通用延迟任务表：impact 回采、autonomy 周期巡检、未来其它后台 job 都落这张表。
+# APScheduler 只做高频 tick（默认 30s），真正的 job 状态在 DB，进程重启可恢复。
 #
-# 关键不变量：
-# 1. Job 未到点 → status="scheduled"，collector 跳过。
-# 2. 事实表无数据 → envelope 保留 metrics={}, completeness=0.0，
-#    禁止用 0 冒充 delta（Phase 4.1 已定的语义）。
-# 3. 一条 job 只允许被成功执行一次；重复调用是 no-op。
-class AgentImpactJobDB(Base):
-    __tablename__ = "agent_impact_jobs"
+# 状态机（应用层强制）：
+#   scheduled → running → done
+#                      └→ failed（attempts < max_attempts 时由 recover_stale 复位为 scheduled）
+# 启动时 recover_stale 把 started_at 早于 stale_timeout 的 running job 复位，
+# 保证进程崩溃不会让 job 永远卡在 running。
+#
+# idempotency_key：同 key 的 job 只允许一条（UNIQUE），用于重入去重；
+# impact job 用 f"impact:{action_id}:{kind}:{window}"。
+class JobDB(Base):
+    __tablename__ = "agent_jobs"
 
     id = Column(String(32), primary_key=True)
-    action_id = Column(String(32), ForeignKey("agent_actions.id"), nullable=False, index=True)
-    app_id = Column(Integer, index=True, nullable=False)
-    kind = Column(String(16), nullable=False)   # "observed" | "attributed"
-    window = Column(String(8), nullable=False)  # "2h" | "24h" | "7d"
+    job_type = Column(String(64), nullable=False, index=True)
+    idempotency_key = Column(String(128), nullable=False)
+
+    status = Column(String(16), nullable=False, default="scheduled", index=True)
+    # scheduled / running / done / failed / cancelled
 
     scheduled_at = Column(DateTime, nullable=False, index=True)
-    executed_at = Column(DateTime, nullable=True)
-    status = Column(String(16), nullable=False, default="scheduled", index=True)
-    # scheduled / running / done / failed / skipped
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
 
-    envelope_json = Column(JSON, nullable=True)  # 落成时写入的 envelope 副本
-    error = Column(Text, nullable=True)
+    payload = Column(JSON, nullable=True)
+    result = Column(JSON, nullable=True)
+    attempts = Column(Integer, default=0, nullable=False)
+    max_attempts = Column(Integer, default=1, nullable=False)
+    last_error = Column(Text, nullable=True)
+
+    app_id = Column(Integer, nullable=True, index=True)
 
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     __table_args__ = (
-        UniqueConstraint("action_id", "kind", "window", name="uq_impact_job_action_kind_window"),
-        Index("ix_impact_jobs_due", "status", "scheduled_at"),
+        UniqueConstraint("idempotency_key", name="uq_agent_jobs_idempotency"),
+        Index("ix_agent_jobs_due", "status", "scheduled_at"),
+        Index("ix_agent_jobs_type_status", "job_type", "status"),
     )

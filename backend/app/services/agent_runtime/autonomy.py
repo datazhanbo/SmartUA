@@ -485,20 +485,95 @@ class AutonomyStore:
 
 
 # --------------------------------------------------------------------------- #
-# 调度器（APScheduler）：后台周期巡检
+# Durable job handler
+# --------------------------------------------------------------------------- #
+def run_autonomy_scan_job(db, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """JobRunner 入口：跑一次 AutonomyEngine.scan。
+
+    payload: {"app_id": int}
+    """
+    app_id = int(payload["app_id"])
+    engine = AutonomyEngine()
+    # AutonomyEngine.scan 自己开 SessionLocal；这里不需要用传入的 db 写结果，
+    # 但把扫描摘要落进 job.result 便于审计。
+    import time as _time
+    started = _time.time()
+    engine.scan(app_id=app_id)
+    return {
+        "app_id": app_id,
+        "elapsed_ms": int((_time.time() - started) * 1000),
+    }
+
+
+def enqueue_autonomy_scan_jobs() -> int:
+    """由调度器每个 interval 调用，为每个 monitor app 入队一条 autonomy_scan job。
+
+    用时间桶做 idempotency_key：同一进程同一 interval 内多次触发只入队一条，
+    崩溃重启后未跑完的上一桶仍会被 runner 拾起。
+    `agent_autonomy_enabled=false` 时直接返回 0（job runner tick 仍跑，
+    impact_collect 等其它 job_type 继续消费）。
+    """
+    if not settings.agent_autonomy_enabled:
+        return 0
+    from app.services.agent_runtime.jobs import get_job_runner
+    store = get_autonomy_store()
+    interval = max(30, int(store.interval_seconds))
+    bucket = int(datetime.utcnow().timestamp() // interval) * interval
+    runner = get_job_runner()
+    n = 0
+    db = SessionLocal()
+    try:
+        for app_id in settings.agent_monitor_app_ids:
+            job = runner.enqueue(
+                db,
+                "autonomy_scan",
+                payload={"app_id": int(app_id)},
+                scheduled_at=datetime.utcnow(),
+                idempotency_key=f"autonomy:scan:{app_id}:{bucket}",
+                app_id=int(app_id),
+                max_attempts=1,
+            )
+            if job is not None:
+                n += 1
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception("enqueue autonomy scan jobs failed")
+    finally:
+        db.close()
+    return n
+
+
+# --------------------------------------------------------------------------- #
+# 调度器（APScheduler）：只做 tick，真正执行在 Durable JobRunner
 # --------------------------------------------------------------------------- #
 _scheduler = None
 
 
-def _scheduled_scan():
+def _scheduled_enqueue():
     try:
-        for app_id in settings.agent_monitor_app_ids:
-            AutonomyEngine().scan(app_id=app_id)
+        enqueue_autonomy_scan_jobs()
     except Exception as e:  # 调度任务内部异常不应拖垮整个进程
-        logger.warning("autonomy scheduled scan failed: %s", e)
+        logger.warning("autonomy enqueue failed: %s", e)
+
+
+def _scheduled_run_pending():
+    from app.services.agent_runtime.jobs import get_job_runner
+    db = SessionLocal()
+    try:
+        runner = get_job_runner()
+        runner.recover_stale(db)
+        runner.run_pending(db, limit=100)
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception("job runner tick failed")
+    finally:
+        db.close()
 
 
 def start_scheduler():
+    """启动 APScheduler：一个 job 定时 enqueue autonomy_scan，一个 job 高频 tick runner。"""
     global _scheduler
     if _scheduler is not None:
         return
@@ -507,13 +582,34 @@ def start_scheduler():
     except Exception as e:
         logger.warning("APScheduler 不可用，主动巡检调度未启动：%s", e)
         return
+
+    from app.services.agent_runtime.jobs import get_job_runner, register_default_handlers
+    register_default_handlers()
+
     store = get_autonomy_store()
+    tick_seconds = max(15, int(getattr(settings, "agent_jobs_tick_seconds", 30)))
+
     _scheduler = BackgroundScheduler()
     _scheduler.add_job(
-        _scheduled_scan, "interval",
-        seconds=store.interval_seconds, id="autonomy_scan")
+        _scheduled_enqueue, "interval",
+        seconds=store.interval_seconds, id="autonomy_enqueue",
+        next_run_time=datetime.utcnow())  # 启动立即补一次
+    _scheduler.add_job(
+        _scheduled_run_pending, "interval",
+        seconds=tick_seconds, id="job_runner_tick",
+        next_run_time=datetime.utcnow())  # 启动立即补一次
     _scheduler.start()
-    logger.info("主动自治调度已启动（间隔 %ss）", store.interval_seconds)
+
+    # 启动时立刻做一次 stale recover + run_pending，捡起离线期间到点的 job
+    try:
+        _scheduled_run_pending()
+    except Exception:
+        logger.exception("startup run_pending failed")
+
+    logger.info(
+        "Durable 调度已启动（autonomy 间隔 %ss, runner tick %ss）",
+        store.interval_seconds, tick_seconds,
+    )
 
 
 def stop_scheduler():

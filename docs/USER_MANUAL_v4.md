@@ -273,9 +273,28 @@ Note 前缀 `[usable=N 条真实样本]`，例如：
 | `agent_mcp_servers` | `[]` | MCP server 列表 JSON：`name/url/headers/timeout/tool_risk`（v4.2） |
 | `agent_skills_enabled` | `true` | 是否加载 `data/skills/*.md`（v4.2） |
 | `agent_skills_dir` | `backend/data/skills` | skill 目录（v4.2） |
+| `agent_jobs_tick_seconds` | `30` | Durable JobRunner tick 间隔（秒）：从 `agent_jobs` 表拾起到点 job 执行（v4.3） |
+| `agent_jobs_stale_minutes` | `10` | running job 超过该分钟数视为崩溃，`recover_stale` 自动复位或落 failed（v4.3） |
 | `agent_strategy_path` | `backend/data/strategy.json` | 策略落盘路径 |
 
 启动前置：`alembic upgrade head` —— v3 起 schema 由 Alembic 管理，`create_all()` 仅保留在测试路径。
+
+---
+
+## 9.5 Durable 后台任务（v4.3 新增）
+
+所有延迟 / 周期任务统一落 `agent_jobs` 表，APScheduler 只做 30s tick，不再直接跑业务：
+
+- **impact 回采**：动作 verified 后入队 6 条 job（`observed/attributed × 2h/24h/7d`），到点由 JobRunner 执行并写回 `AgentActionDB.observed/attributed_impact_json`。
+- **autonomy 巡检**：每个 interval 按时间桶入队一条 `autonomy_scan` job（同 interval 内不重复），JobRunner 到点调 `AutonomyEngine.scan`。
+- **进程重启自动恢复**：启动瞬间先 `recover_stale + run_pending`，离线期间到点的 impact job、上次崩溃卡在 `running` 的任务都会被拾起。
+- **幂等**：同 `idempotency_key` 的 job 只入队一次；impact 用 `impact:{action_id}:{kind}:{window}`，autonomy 用 `autonomy:scan:{app_id}:{bucket}`。
+- **重试**：`max_attempts`（默认 1）耗尽才落 `failed`；期间异常回 `scheduled` 等下一 tick。
+- **手动触发**：`POST /api/v1/agent/impact/collect` 仍可即时跑到点 impact job（运维 / 验收用），不依赖调度器。
+
+调优：`agent_jobs_tick_seconds`（默认 30s，高频但轻量）、`agent_jobs_stale_minutes`（默认 10 分钟，超过即视为崩溃）。
+
+刻意不做：多实例并发锁、priority queue、DAG 依赖——单进程 + SQLite 阶段不需要；等真有第二个实例再加 claim token。
 
 ---
 
